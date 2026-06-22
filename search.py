@@ -95,19 +95,34 @@ async def search_youtube(query: str, max_results: int = 10) -> List[SearchResult
     return results
 
 
-async def extract_audio_url(video_url: str) -> Optional[str]:
-    """Extracts the direct audio-stream URL for a YouTube video."""
-    stdout, _stderr = await _run_ytdlp(
+async def extract_audio_url(video_url: str) -> tuple[Optional[str], Optional[str]]:
+    """Extracts the direct audio-stream URL for a YouTube video.
+
+    Returns ``(url, None)`` on success, ``(None, error_msg)`` on failure.
+    """
+    stdout, stderr = await _run_ytdlp(
         "--dump-json",
         "-f", "bestaudio",
         video_url,
     )
 
     if not stdout:
-        return None
+        err = stderr.decode("utf-8", errors="replace")[:200] if stderr else ""
+        if "private" in err.lower():
+            return None, "Video is private"
+        if "copyright" in err.lower() or "removed" in err.lower():
+            return None, "Video unavailable (copyright / removed)"
+        if "age" in err.lower() or "restrict" in err.lower():
+            return None, "Age-restricted content"
+        if err:
+            return None, err.strip()
+        return None, "No audio stream available"
 
     try:
         data = json.loads(stdout.decode("utf-8").strip())
-        return data.get("url")
+        url = data.get("url")
+        if url:
+            return url, None
+        return None, "No audio stream URL found"
     except json.JSONDecodeError:
-        return None
+        return None, "Failed to parse stream data"

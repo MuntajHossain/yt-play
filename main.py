@@ -1,50 +1,175 @@
 from textual.app import App, ComposeResult
-from textual.containers import Container
-from textual.widgets import Header, Footer, Input, OptionList
+from textual.containers import Container, Horizontal, Vertical
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Header, Footer, Input, OptionList, Button, Label, ProgressBar
+from textual.widgets.option_list import Option
 from textual import work
 
 from search import search_youtube, extract_audio_url
 from player import MpvPlayer
-from ui_components import SearchWidget, ResultsWidget, PlayerControlWidget
 
+
+# ---------------------------------------------------------------------------
+# Modal
+# ---------------------------------------------------------------------------
+
+class QuitScreen(ModalScreen[bool]):
+    CSS = """
+    QuitScreen { align: center middle; }
+    QuitScreen > Container {
+        width: 40; height: auto; padding: 2;
+        border: solid $primary; background: $surface;
+    }
+    QuitScreen Horizontal { height: auto; align: center middle; margin-top: 1; }
+    QuitScreen Button { margin: 0 1; }
+    """
+    def compose(self) -> ComposeResult:
+        with Container():
+            yield Label("Quit YouTube Player?", id="quit_question")
+            with Horizontal():
+                yield Button("Yes", variant="error", id="quit_yes")
+                yield Button("No", variant="primary", id="quit_no")
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "quit_yes")
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.dismiss(False)
+
+
+# ---------------------------------------------------------------------------
+# Screens
+# ---------------------------------------------------------------------------
+
+class SearchScreen(Screen):
+    CSS = """
+    SearchScreen { align: center middle; }
+    SearchScreen > Vertical { width: 60; height: auto; }
+    Input { margin-bottom: 1; }
+    Label { text-align: center; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical():
+            yield Input(placeholder="Search YouTube...", id="search_input")
+            yield Label("Press Enter to search")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "search_input" and event.input.value:
+            app: YouTubePlayerApp = self.app  # type: ignore
+            app.do_search(event.input.value)
+
+
+class ResultsScreen(Screen):
+    CSS = """
+    ResultsScreen { layout: vertical; }
+    #results_title { padding: 0 1; }
+    #results_list { height: 1fr; }
+    #results_help { padding: 0 1; text-style: dim; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Label("Search Results", id="results_title")
+        yield OptionList(id="results_list")
+        yield Label("[Esc] Back to search  —  [N]ext  [P]rev  available during playback", id="results_help")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        app: YouTubePlayerApp = self.app  # type: ignore
+        results = app.results
+        title = self.query_one("#results_title", Label)
+        option_list = self.query_one("#results_list", OptionList)
+        title.update(f"Search Results ({len(results)})")
+        option_list.clear_options()
+        for i, res in enumerate(results):
+            text = f"{res.title} [{res.duration_str}] - {res.uploader}"
+            option_list.add_option(Option(text, id=f"result_{i}"))
+        self.query_one("#results_list").focus()
+
+    async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id == "results_list":
+            app: YouTubePlayerApp = self.app  # type: ignore
+            app.play_at(event.option_index)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.app.pop_screen()
+
+
+class PlayerScreen(Screen):
+    CSS = """
+    PlayerScreen { layout: vertical; }
+    #now_playing { padding: 1; text-align: center; }
+    #progress_container { height: auto; align: center middle; margin: 0 2; }
+    #time_current, #time_total { width: 8; text-align: center; }
+    ProgressBar { width: 1fr; margin: 0 1; }
+    #controls_help { padding: 0 1; text-align: center; text-style: dim; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Label("Now Playing: Nothing", id="now_playing")
+        with Horizontal(id="progress_container"):
+            yield Label("00:00", id="time_current")
+            yield ProgressBar(total=100, show_eta=False, id="progress_bar")
+            yield Label("00:00", id="time_total")
+        yield Label(
+            "[Space] Play/Pause  [Left/Right] Seek ±5s  [Up/Down] Vol ±5  "
+            "[N]ext  [P]rev  [[/]] Speed ∓0.25  [Esc] Back  [Ctrl+D] Quit",
+            id="controls_help",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        app: YouTubePlayerApp = self.app  # type: ignore
+        self._update_now_playing(app.current_title)
+
+    def update_now_playing(self, title: str) -> None:
+        self._update_now_playing(title)
+
+    def _update_now_playing(self, title: str) -> None:
+        label = self.query_one("#now_playing", Label)
+        if title:
+            label.update(f"Now Playing: {title}")
+        else:
+            label.update("Now Playing: Nothing")
+
+    def update_progress(self, current_time: float, duration: float) -> None:
+        """Called from the player callback – always on the main thread."""
+        if duration > 0:
+            self.query_one(ProgressBar).update(progress=(current_time / duration) * 100)
+        self.query_one("#time_current", Label).update(self._fmt(current_time))
+        self.query_one("#time_total", Label).update(self._fmt(duration))
+
+    @staticmethod
+    def _fmt(seconds: float) -> str:
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        if h:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.app.pop_screen()
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
 class YouTubePlayerApp(App):
     CSS = """
-    Screen {
-        layout: vertical;
-    }
-
-    SearchWidget {
-        height: auto;
-        padding: 1;
-        border: solid green;
-    }
-
-    ResultsWidget {
-        height: 1fr;
-        padding: 1;
-        border: solid blue;
-    }
-
-    PlayerControlWidget {
-        height: auto;
-        padding: 1;
-        border: solid red;
-    }
-
-    #progress_container {
-        height: auto;
-        align: center middle;
-    }
-
-    ProgressBar {
-        width: 1fr;
-        margin: 0 2;
-    }
+    Screen { layout: vertical; }
     """
 
     BINDINGS = [
-        ("ctrl+q", "quit", "Quit"),
+        ("ctrl+d", "quit", "Quit"),
         ("space", "toggle_pause", "Play/Pause"),
         ("right", "seek_forward", "Seek +5s"),
         ("left", "seek_backward", "Seek -5s"),
@@ -52,6 +177,8 @@ class YouTubePlayerApp(App):
         ("down", "volume_down", "Vol -5"),
         ("n", "next_track", "Next"),
         ("p", "prev_track", "Prev"),
+        ("]", "speed_up", "Speed +"),
+        ("[", "speed_down", "Speed -"),
     ]
 
     def __init__(self):
@@ -61,128 +188,97 @@ class YouTubePlayerApp(App):
         self.player.on_error = self._on_player_error
         self.player.on_end = self._on_track_end
 
-        # Cached widget references (set in on_mount)
-        self._search_widget: SearchWidget = None  # type: ignore
-        self._results_widget: ResultsWidget = None  # type: ignore
-        self._player_ctrl: PlayerControlWidget = None  # type: ignore
+        self.results: list = []
+        self.current_index: int = -1
+        self.current_title: str = ""
 
-        # Playback state
-        self._results: list = []
-        self._current_index: int = -1
-        self._current_title: str = ""
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        with Container():
-            yield SearchWidget()
-            yield ResultsWidget()
-            yield PlayerControlWidget()
-        yield Footer()
+    # -- Navigation -------------------------------------------------------
 
     def on_mount(self) -> None:
-        self._search_widget = self.query_one(SearchWidget)
-        self._results_widget = self.query_one(ResultsWidget)
-        self._player_ctrl = self.query_one(PlayerControlWidget)
+        self.push_screen(SearchScreen())
 
     def action_quit(self) -> None:
-        self.player.stop()
-        self.exit()
+        def _cb(result: bool) -> None:
+            if result:
+                self.player.stop()
+                self.exit()
+        self.push_screen(QuitScreen(), _cb)
 
-    # ------------------------------------------------------------------
-    # Search
-    # ------------------------------------------------------------------
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "search_input":
-            query = event.input.value
-            if query:
-                self.action_search(query)
+    # -- Search -----------------------------------------------------------
 
     @work(exclusive=True)
-    async def action_search(self, query: str) -> None:
-        self._results_widget.show_loading(f"Searching for '{query}'...")
-        results = await search_youtube(query)
-        self._results = results
-        self._results_widget.populate(results)
-        count = len(results)
-        self._results_widget.show_count(count)
+    async def do_search(self, query: str) -> None:
+        self.results = await search_youtube(query)
+        self.current_index = -1
+        self.current_title = ""
+        self.push_screen(ResultsScreen())
 
-    # ------------------------------------------------------------------
-    # Playback
-    # ------------------------------------------------------------------
+    # -- Playback ---------------------------------------------------------
 
-    def _play_at(self, index: int):
-        """Play the result at *index* (adds all results as a queue)."""
-        if index < 0 or index >= len(self._results):
+    def play_at(self, index: int) -> None:
+        if index < 0 or index >= len(self.results):
             return
-
-        self._current_index = index
-        result = self._results[index]
-        self._current_title = result.title
-        self._player_ctrl.update_status(False, f"Loading {result.title}...")
+        self.current_index = index
+        result = self.results[index]
+        self.current_title = result.title
         self._play_video_async(result.url, result.title)
+        self.push_screen(PlayerScreen())
 
     @work(exclusive=True)
     async def _play_video_async(self, url: str, title: str) -> None:
-        audio_url = await extract_audio_url(url)
+        audio_url, err = await extract_audio_url(url)
         if audio_url:
             self.player.play(audio_url)
-            self._player_ctrl.update_status(True, title)
+            player_screen = self.screen
+            if isinstance(player_screen, PlayerScreen):
+                player_screen.update_now_playing(title)
         else:
-            self._player_ctrl.update_status(False, "Failed to load audio")
-            self.notify("Failed to load audio", title="Error", severity="error")
+            self.notify(err or "Failed to load audio", title="Error", severity="error")
+            if isinstance(self.screen, PlayerScreen):
+                self.pop_screen()
 
-    async def on_option_list_option_selected(
-        self, event: OptionList.OptionSelected
-    ) -> None:
-        if event.option_list.id == "results_list":
-            self._play_at(event.option_index)
-
-    # ------------------------------------------------------------------
-    # Player callbacks (called from player thread)
-    # ------------------------------------------------------------------
+    # -- Player callbacks (from player thread) ----------------------------
 
     def _on_time_update(self, current_time: float, duration: float) -> None:
         try:
-            self.call_from_thread(
-                self._player_ctrl.update_progress, current_time, duration
-            )
+            self.call_from_thread(self._update_player_progress, current_time, duration)
         except Exception:
             pass
 
+    def _update_player_progress(self, current_time: float, duration: float) -> None:
+        ps = self.screen
+        if isinstance(ps, PlayerScreen):
+            ps.update_progress(current_time, duration)
+
     def _on_player_error(self, message: str) -> None:
-        self.call_from_thread(
-            self.notify, message, title="Player Error", severity="error"
-        )
+        try:
+            self.call_from_thread(self.notify, message, title="Player Error", severity="error")
+        except Exception:
+            pass
 
     def _on_track_end(self) -> None:
-        """Called when mpv finishes playing a track."""
-        self.call_from_thread(self._advance_to_next)
+        try:
+            self.call_from_thread(self._advance_to_next)
+        except Exception:
+            pass
 
-    def _advance_to_next(self):
-        """Advance to the next track in the queue, if available."""
-        next_index = self._current_index + 1
-        if 0 <= next_index < len(self._results):
-            self._play_at(next_index)
+    def _advance_to_next(self) -> None:
+        next_index = self.current_index + 1
+        if 0 <= next_index < len(self.results):
+            self.play_at(next_index)
         else:
-            self._player_ctrl.update_status(False, "Playback finished")
-            self._current_index = -1
-            self._current_title = ""
+            self.current_index = -1
+            self.current_title = ""
+            self.notify("Playback finished", timeout=2)
+            # pop to the screen below PlayerScreen (ResultsScreen or SearchScreen)
+            if isinstance(self.screen, PlayerScreen):
+                self.pop_screen()
 
-    # ------------------------------------------------------------------
-    # Actions (keyboard bindings)
-    # ------------------------------------------------------------------
+    # -- Keyboard actions -------------------------------------------------
 
     def action_toggle_pause(self) -> None:
         if self.player.process:
             self.player.toggle_pause()
-            self._player_ctrl.update_status(
-                self.player.is_playing, self._current_title
-            )
 
     def action_seek_forward(self) -> None:
         if self.player.process:
@@ -195,20 +291,40 @@ class YouTubePlayerApp(App):
     def action_volume_up(self) -> None:
         if self.player.process:
             self.player.volume_up()
-            self.notify("Volume +5", title="Volume", timeout=1)
+            self.notify(f"Volume {self.player.volume:.0f}", title="Volume", timeout=1)
 
     def action_volume_down(self) -> None:
         if self.player.process:
             self.player.volume_down()
-            self.notify("Volume -5", title="Volume", timeout=1)
+            self.notify(f"Volume {self.player.volume:.0f}", title="Volume", timeout=1)
+
+    def action_speed_up(self) -> None:
+        if self.player.process:
+            self.player.speed_up()
+            self.notify(f"Speed {self.player.speed:.2f}x", title="Speed", timeout=1)
+
+    def action_speed_down(self) -> None:
+        if self.player.process:
+            self.player.speed_down()
+            self.notify(f"Speed {self.player.speed:.2f}x", title="Speed", timeout=1)
 
     def action_next_track(self) -> None:
-        if self._results and self._current_index < len(self._results) - 1:
-            self._play_at(self._current_index + 1)
+        if not self.results:
+            self.notify("No results loaded", title="Next", timeout=1)
+            return
+        if self.current_index < len(self.results) - 1:
+            self.play_at(self.current_index + 1)
+        else:
+            self.notify("Already at last track", title="Next", timeout=1)
 
     def action_prev_track(self) -> None:
-        if self._results and self._current_index > 0:
-            self._play_at(self._current_index - 1)
+        if not self.results:
+            self.notify("No results loaded", title="Prev", timeout=1)
+            return
+        if self.current_index > 0:
+            self.play_at(self.current_index - 1)
+        else:
+            self.notify("Already at first track", title="Prev", timeout=1)
 
 
 if __name__ == "__main__":

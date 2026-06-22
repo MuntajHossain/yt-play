@@ -1,38 +1,24 @@
-import json
-import subprocess
-import threading
-import time
 import os
-import tempfile
-import shutil
+import threading
 from typing import Callable, Optional
+
+# Ensure libmpv DLL is findable
+os.environ["PATH"] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + os.environ.get("PATH", "")
+
+import mpv
 
 
 class MpvPlayer:
-    """Controls an mpv subprocess via named-pipe / Unix-socket JSON IPC."""
-
-    PIPE_POLL_INTERVAL = 0.1  # seconds between pipe-existence checks
-    PIPE_POLL_MAX = 5.0       # total seconds to wait before giving up
+    """Controls an mpv instance via python-mpv (libmpv) bindings."""
 
     def __init__(self):
-        self.process: Optional[subprocess.Popen] = None
-
-        if os.name == "nt":
-            self.pipe_name = r"\\.\pipe\mpv-yt-play-pipe"
-        else:
-            self.pipe_name = os.path.join(
-                tempfile.gettempdir(), "mpv-yt-play.sock"
-            )
+        self._player: Optional[mpv.MPV] = None
+        self._lock = threading.Lock()
 
         self.is_playing = False
         self.current_time = 0.0
         self.duration = 0.0
         self.title = ""
-
-        self._running = False           # signals the status thread to stop
-        self._pipe_file = None          # file-like object for IPC
-        self._pipe_lock = threading.Lock()
-        self._status_thread: Optional[threading.Thread] = None
 
         # Callbacks – set these before calling play()
         self.on_time_update: Optional[Callable[[float, float], None]] = None
@@ -43,205 +29,123 @@ class MpvPlayer:
     # Public API
     # ------------------------------------------------------------------
 
+    @property
+    def process(self) -> bool:
+        """Whether a player instance is active."""
+        return self._player is not None
+
     def play(self, url: str):
-        """Start playing *url* (audio-only) through a new mpv subprocess."""
+        """Start playing *url* (audio-only) through a new mpv instance."""
         self.stop()
 
-        if not shutil.which("mpv"):
-            self._notify_error("mpv is not installed or not in PATH.")
-            return
-
-        # Clean up stale pipe from previous runs
-        if os.name != "nt" and os.path.exists(self.pipe_name):
-            try:
-                os.remove(self.pipe_name)
-            except OSError:
-                pass
-
-        cmd = [
-            "mpv",
-            "--no-video",
-            f"--input-ipc-server={self.pipe_name}",
-            "--idle=yes",
-            url,
-        ]
-
-        startupinfo = None
-        if os.name == "nt":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-        self.process = subprocess.Popen(
-            cmd,
-            startupinfo=startupinfo,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        self.is_playing = True
-        self._running = True
-
-        # Poll for the pipe to appear instead of a blind sleep
-        if not self._wait_for_pipe():
-            self._notify_error("mpv started but IPC pipe did not appear.")
-            self.stop()
-            return
-
-        # Open the pipe
         try:
-            if os.name == "nt":
-                self._pipe_file = open(self.pipe_name, "w+t", encoding="utf-8")
-            else:
-                import socket
-
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.connect(self.pipe_name)
-                self._pipe_file = sock.makefile("rw", encoding="utf-8")
-
-            # Ask mpv to push time / duration changes automatically
-            self._send_command(["observe_property", 1, "playback-time"])
-            self._send_command(["observe_property", 2, "duration"])
-
-            # Start the reader thread (non-daemon so stop() can join it)
-            self._status_thread = threading.Thread(
-                target=self._status_loop, daemon=False
+            self._player = mpv.MPV(
+                video=False,
+                input_default_bindings=False,
+                input_vo_keyboard=False,
+                osc=False,
+                idle=True,
             )
-            self._status_thread.start()
-
         except Exception as e:
-            self._notify_error(f"IPC connection failed: {e}")
-            self.stop()
+            self._notify_error(f"Failed to create mpv player: {e}")
+            return
+
+        player = self._player
+        player.volume = 50
+
+        # Register property observers for time / duration
+        @player.property_observer("time-pos")
+        def _on_time_pos(_name, value):
+            if value is not None:
+                self.current_time = float(value)
+                dur = self.duration
+                if self.on_time_update:
+                    self.on_time_update(self.current_time, dur)
+
+        @player.property_observer("duration")
+        def _on_duration(_name, value):
+            if value is not None:
+                self.duration = float(value)
+
+        # Register end-file event
+        @player.event_callback("end-file")
+        def _on_end_file(event):
+            self.is_playing = False
+            if self.on_end:
+                self.on_end()
+
+        # Start playback
+        try:
+            player.play(url)
+            self.is_playing = True
+        except Exception as e:
+            self._notify_error(f"Failed to play: {e}")
+            self._cleanup()
 
     def toggle_pause(self):
-        self._send_command(["cycle", "pause"])
-        self.is_playing = not self.is_playing
+        if self._player:
+            self._player.pause = not self._player.pause
+            self.is_playing = not self._player.pause
 
     def seek(self, seconds: float):
-        self._send_command(["seek", str(seconds)])
+        if self._player:
+            self._player.seek(seconds, reference="relative")
+
+    @property
+    def volume(self) -> int:
+        return self._player.volume if self._player else 50
 
     def set_volume(self, volume: int):
-        """Set volume (0–100)."""
-        self._send_command(["set", "volume", max(0, min(100, volume))])
+        if self._player:
+            self._player.volume = max(0, min(100, volume))
 
     def volume_up(self, delta: int = 5):
-        self._send_command(["add", "volume", str(delta)])
+        if self._player:
+            self._player.volume = min(100, self._player.volume + delta)
 
     def volume_down(self, delta: int = 5):
-        self._send_command(["add", "volume", str(-delta)])
+        if self._player:
+            self._player.volume = max(0, self._player.volume - delta)
+
+    @property
+    def speed(self) -> float:
+        return self._player.speed if self._player else 1.0
+
+    def speed_up(self, delta: float = 0.25):
+        if self._player:
+            self._player.speed = min(3.0, self._player.speed + delta)
+
+    def speed_down(self, delta: float = 0.25):
+        if self._player:
+            self._player.speed = max(0.25, self._player.speed - delta)
 
     def stop(self):
-        """Terminate mpv, close the pipe, and wait for the reader thread."""
-        self._running = False
-
-        # Close the pipe so the status thread unblocks
-        with self._pipe_lock:
-            if self._pipe_file:
-                try:
-                    self._pipe_file.close()
-                except Exception:
-                    pass
-                self._pipe_file = None
-
-        # Join the reader thread before killing the process
-        if self._status_thread and self._status_thread.is_alive():
-            self._status_thread.join(timeout=3)
-
-        # Kill the subprocess
-        if self.process:
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=2)
-            except Exception:
-                try:
-                    self.process.kill()
-                except Exception:
-                    pass
-            self.process = None
-
+        """Terminate mpv and clean up."""
+        self._cleanup()
         self.is_playing = False
         self.current_time = 0.0
         self.duration = 0.0
-        self._status_thread = None
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _wait_for_pipe(self) -> bool:
-        """Block until the IPC pipe/socket exists.  Returns False on timeout."""
-        elapsed = 0.0
-        while elapsed < self.PIPE_POLL_MAX:
-            if os.name == "nt":
-                if os.path.exists(self.pipe_name):
-                    return True
-            else:
-                if os.path.exists(self.pipe_name):
-                    return True
-            time.sleep(self.PIPE_POLL_INTERVAL)
-            elapsed += self.PIPE_POLL_INTERVAL
-        return False
-
-    def _send_command(self, command: list):
-        with self._pipe_lock:
-            if self._pipe_file and not self._pipe_file.closed:
+    def _cleanup(self):
+        with self._lock:
+            if self._player:
                 try:
-                    cmd_json = json.dumps({"command": command}) + "\n"
-                    self._pipe_file.write(cmd_json)
-                    self._pipe_file.flush()
+                    self._player.terminate()
                 except Exception:
                     pass
+                self._player = None
 
     def _notify_error(self, msg: str):
         if self.on_error:
             self.on_error(msg)
 
-    def _notify_end(self):
-        if self.on_end:
-            self.on_end()
-
     # ------------------------------------------------------------------
-    # Reader thread – runs until stop() is called or the pipe breaks
+    # Cleanup on garbage collection
     # ------------------------------------------------------------------
 
-    def _status_loop(self):
-        while self._running:
-            pipe = self._pipe_file
-            if not pipe or pipe.closed:
-                break
-
-            try:
-                line = pipe.readline()
-                if not line:
-                    break
-
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                if "event" not in data:
-                    continue
-
-                event = data["event"]
-
-                if event == "end-file":
-                    self.is_playing = False
-                    self._notify_end()
-                    break
-                elif event == "property-change":
-                    name = data.get("name")
-                    value = data.get("data")
-                    if value is not None:
-                        if name == "playback-time":
-                            self.current_time = float(value)
-                        elif name == "duration":
-                            self.duration = float(value)
-                        if self.on_time_update:
-                            self.on_time_update(
-                                self.current_time, self.duration
-                            )
-            except Exception:
-                break
-
-        # Thread exiting – make sure state is clean
-        self.is_playing = False
+    def __del__(self):
+        self._cleanup()

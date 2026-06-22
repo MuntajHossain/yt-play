@@ -1,0 +1,14 @@
+Refactor to 3-screen arch, fix blockers, add speed controls
+
+- 3-screen architecture: SearchScreen / ResultsScreen / PlayerScreen via push_screen
+- Remove ui_components.py, inline widget logic into screen classes
+- Quit via Ctrl+D with modal confirmation (avoids VS Code Ctrl+Q conflict)
+- Speed up/down bindings ([ / ]) with 0.25–3.0x range
+- Set initial mpv volume to 50; expose volume property
+- extract_audio_url returns (url, error) tuple with typed messages
+- Error callbacks guard with isinstance(screen, PlayerScreen) check
+- Add python-mpv>=1.0.0 to pyproject.toml
+- Fill README.md with usage and key bindings
+- Update AGENTS.md to reflect new arch
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>
