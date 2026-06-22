@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -10,12 +11,12 @@ from textual import work
 from search import search_youtube, extract_audio_url
 from player import MpvPlayer
 
+os.makedirs("log", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler("yt-play.log"),
-        logging.StreamHandler(),
+        logging.FileHandler(os.path.join("log", "yt-play.log")),
     ],
 )
 log = logging.getLogger("yt-play")
