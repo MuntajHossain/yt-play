@@ -1,7 +1,7 @@
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Header, Footer, Input, OptionList, Button, Label, ProgressBar
+from textual.widgets import Header, Footer, Input, OptionList, Label, ProgressBar
 from textual.widgets.option_list import Option
 from textual import work
 
@@ -14,26 +14,18 @@ from player import MpvPlayer
 # ---------------------------------------------------------------------------
 
 class QuitScreen(ModalScreen[bool]):
-    CSS = """
-    QuitScreen { align: center middle; }
-    QuitScreen > Container {
-        width: 40; height: auto; padding: 2;
-        border: solid $primary; background: $surface;
-    }
-    QuitScreen Horizontal { height: auto; align: center middle; margin-top: 1; }
-    QuitScreen Button { margin: 0 1; }
-    """
+    """Keyboard-driven quit confirmation. Y / N / Escape."""
+    BINDINGS = [
+        ("y", "yes", "Yes"),
+        ("n", "no", "No"),
+        ("escape", "no", "Cancel"),
+    ]
     def compose(self) -> ComposeResult:
-        with Container():
-            yield Label("Quit YouTube Player?", id="quit_question")
-            with Horizontal():
-                yield Button("Yes", variant="error", id="quit_yes")
-                yield Button("No", variant="primary", id="quit_no")
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "quit_yes")
-    def on_key(self, event) -> None:
-        if event.key == "escape":
-            self.dismiss(False)
+        yield Label("Quit YouTube Player? (y/n)")
+    def action_yes(self) -> None:
+        self.dismiss(True)
+    def action_no(self) -> None:
+        self.dismiss(False)
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +44,7 @@ class SearchScreen(Screen):
         yield Header(show_clock=True)
         with Vertical():
             yield Input(placeholder="Search YouTube...", id="search_input")
-            yield Label("Press Enter to search")
+            yield Label("Press Enter to search", id="search_status")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -60,6 +52,7 @@ class SearchScreen(Screen):
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "search_input" and event.input.value:
+            self.query_one("#search_status", Label).update("Searching...")
             app: YouTubePlayerApp = self.app  # type: ignore
             app.do_search(event.input.value)
 
@@ -201,7 +194,11 @@ class YouTubePlayerApp(App):
         def _cb(result: bool) -> None:
             if result:
                 self.player.stop()
-                self.exit()
+                if isinstance(self.screen, SearchScreen):
+                    self.exit()
+                else:
+                    while not isinstance(self.screen, SearchScreen):
+                        self.pop_screen()
         self.push_screen(QuitScreen(), _cb)
 
     # -- Search -----------------------------------------------------------
