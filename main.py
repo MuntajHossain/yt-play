@@ -1,3 +1,5 @@
+import logging
+from typing import Optional
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
@@ -7,6 +9,16 @@ from textual import work
 
 from search import search_youtube, extract_audio_url
 from player import MpvPlayer
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler("yt-play.log"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("yt-play")
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +196,10 @@ class YouTubePlayerApp(App):
         self.results: list = []
         self.current_index: int = -1
         self.current_title: str = ""
+        self.current_youtube_url: str = ""
+
+        self._recovery_attempts: int = 0
+        self.MAX_RECOVERY_ATTEMPTS: int = 3
 
     # -- Navigation -------------------------------------------------------
 
@@ -194,45 +210,76 @@ class YouTubePlayerApp(App):
         def _cb(result: bool) -> None:
             if result:
                 self.player.stop()
-                if isinstance(self.screen, SearchScreen):
-                    self.exit()
-                else:
-                    while not isinstance(self.screen, SearchScreen):
-                        self.pop_screen()
+                while not isinstance(self.screen, SearchScreen):
+                    self.pop_screen()
         self.push_screen(QuitScreen(), _cb)
 
     # -- Search -----------------------------------------------------------
 
     @work(exclusive=True)
     async def do_search(self, query: str) -> None:
+        log.info("Searching: %s", query)
         self.results = await search_youtube(query)
+        log.info("Search returned %d results", len(self.results))
         self.current_index = -1
         self.current_title = ""
+        self.current_youtube_url = ""
+        self._recovery_attempts = 0
         self.push_screen(ResultsScreen())
 
     # -- Playback ---------------------------------------------------------
 
     def play_at(self, index: int) -> None:
         if index < 0 or index >= len(self.results):
+            log.warning("play_at: invalid index %d (results: %d)", index, len(self.results))
             return
         self.current_index = index
         result = self.results[index]
         self.current_title = result.title
+        self.current_youtube_url = result.url
+        log.info("Playing [%d/%d]: %s (%s)", index + 1, len(self.results), result.title, result.url)
+        self._recovery_attempts = 0
         self._play_video_async(result.url, result.title)
         self.push_screen(PlayerScreen())
 
     @work(exclusive=True)
-    async def _play_video_async(self, url: str, title: str) -> None:
+    async def _play_video_async(self, url: str, title: str, seek_to: float = 0.0) -> None:
         audio_url, err = await extract_audio_url(url)
         if audio_url:
+            log.info("Audio URL resolved, starting playback (seek_to=%.1f)", seek_to)
             self.player.play(audio_url)
+            if seek_to > 0:
+                log.info("Seeking to %.1fs after recovery", seek_to)
+                self.player.seek_absolute(seek_to)
             player_screen = self.screen
             if isinstance(player_screen, PlayerScreen):
                 player_screen.update_now_playing(title)
         else:
+            log.error("Failed to get audio URL: %s", err)
             self.notify(err or "Failed to load audio", title="Error", severity="error")
             if isinstance(self.screen, PlayerScreen):
                 self.pop_screen()
+
+    # -- Recovery ---------------------------------------------------------
+
+    def _attempt_recovery(self) -> None:
+        if self._recovery_attempts >= self.MAX_RECOVERY_ATTEMPTS:
+            log.error("Max recovery attempts (%d) reached, giving up", self.MAX_RECOVERY_ATTEMPTS)
+            self.notify("Playback failed after multiple retries", severity="error")
+            self._recovery_attempts = 0
+            if isinstance(self.screen, PlayerScreen):
+                self.pop_screen()
+            return
+
+        if not self.current_youtube_url or self.current_index < 0:
+            log.warning("No track info for recovery (url=%s, index=%d)", self.current_youtube_url, self.current_index)
+            return
+
+        self._recovery_attempts += 1
+        last_position = self.player.current_time
+        log.info("Recovery attempt %d/%d — re-extracting URL, seek to %.1fs",
+                 self._recovery_attempts, self.MAX_RECOVERY_ATTEMPTS, last_position)
+        self._play_video_async(self.current_youtube_url, self.current_title, seek_to=last_position)
 
     # -- Player callbacks (from player thread) ----------------------------
 
@@ -240,7 +287,7 @@ class YouTubePlayerApp(App):
         try:
             self.call_from_thread(self._update_player_progress, current_time, duration)
         except Exception:
-            pass
+            log.exception("_on_time_update call_from_thread failed")
 
     def _update_player_progress(self, current_time: float, duration: float) -> None:
         ps = self.screen
@@ -248,26 +295,38 @@ class YouTubePlayerApp(App):
             ps.update_progress(current_time, duration)
 
     def _on_player_error(self, message: str) -> None:
+        log.error("Player error: %s", message)
         try:
             self.call_from_thread(self.notify, message, title="Player Error", severity="error")
         except Exception:
-            pass
+            log.exception("_on_player_error call_from_thread failed")
 
-    def _on_track_end(self) -> None:
+    def _on_track_end(self, error_msg: Optional[str] = None) -> None:
         try:
-            self.call_from_thread(self._advance_to_next)
+            self.call_from_thread(self._handle_track_end, error_msg)
         except Exception:
-            pass
+            log.exception("_on_track_end call_from_thread failed")
+
+    def _handle_track_end(self, error_msg: Optional[str] = None) -> None:
+        if error_msg:
+            log.error("Track ended with error: %s", error_msg)
+            self._attempt_recovery()
+        else:
+            log.info("Track ended normally")
+            self._recovery_attempts = 0
+            self._advance_to_next()
 
     def _advance_to_next(self) -> None:
         next_index = self.current_index + 1
         if 0 <= next_index < len(self.results):
+            log.info("Advancing to next track [%d/%d]", next_index + 1, len(self.results))
             self.play_at(next_index)
         else:
+            log.info("Queue exhausted — finished after %d tracks", len(self.results))
             self.current_index = -1
             self.current_title = ""
+            self.current_youtube_url = ""
             self.notify("Playback finished", timeout=2)
-            # pop to the screen below PlayerScreen (ResultsScreen or SearchScreen)
             if isinstance(self.screen, PlayerScreen):
                 self.pop_screen()
 
@@ -276,51 +335,64 @@ class YouTubePlayerApp(App):
     def action_toggle_pause(self) -> None:
         if self.player.process:
             self.player.toggle_pause()
+            log.info("Toggle pause (is_playing=%s)", self.player.is_playing)
 
     def action_seek_forward(self) -> None:
         if self.player.process:
             self.player.seek(5)
+            log.info("Seek +5s (pos=%.1f)", self.player.current_time)
 
     def action_seek_backward(self) -> None:
         if self.player.process:
             self.player.seek(-5)
+            log.info("Seek -5s (pos=%.1f)", self.player.current_time)
 
     def action_volume_up(self) -> None:
         if self.player.process:
             self.player.volume_up()
+            log.info("Volume up -> %d", self.player.volume)
             self.notify(f"Volume {self.player.volume:.0f}", title="Volume", timeout=1)
 
     def action_volume_down(self) -> None:
         if self.player.process:
             self.player.volume_down()
+            log.info("Volume down -> %d", self.player.volume)
             self.notify(f"Volume {self.player.volume:.0f}", title="Volume", timeout=1)
 
     def action_speed_up(self) -> None:
         if self.player.process:
             self.player.speed_up()
+            log.info("Speed up -> %.2fx", self.player.speed)
             self.notify(f"Speed {self.player.speed:.2f}x", title="Speed", timeout=1)
 
     def action_speed_down(self) -> None:
         if self.player.process:
             self.player.speed_down()
+            log.info("Speed down -> %.2fx", self.player.speed)
             self.notify(f"Speed {self.player.speed:.2f}x", title="Speed", timeout=1)
 
     def action_next_track(self) -> None:
         if not self.results:
+            log.warning("Next: no results loaded")
             self.notify("No results loaded", title="Next", timeout=1)
             return
         if self.current_index < len(self.results) - 1:
+            log.info("Next track from index %d", self.current_index)
             self.play_at(self.current_index + 1)
         else:
+            log.info("Next: already at last track")
             self.notify("Already at last track", title="Next", timeout=1)
 
     def action_prev_track(self) -> None:
         if not self.results:
+            log.warning("Prev: no results loaded")
             self.notify("No results loaded", title="Prev", timeout=1)
             return
         if self.current_index > 0:
+            log.info("Prev track from index %d", self.current_index)
             self.play_at(self.current_index - 1)
         else:
+            log.info("Prev: already at first track")
             self.notify("Already at first track", title="Prev", timeout=1)
 
 

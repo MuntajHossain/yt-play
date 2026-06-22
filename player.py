@@ -1,6 +1,9 @@
+import logging
 import os
 import threading
 from typing import Callable, Optional
+
+log = logging.getLogger("yt-play")
 
 # Ensure libmpv DLL is findable
 os.environ["PATH"] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + os.environ.get("PATH", "")
@@ -23,7 +26,8 @@ class MpvPlayer:
         # Callbacks – set these before calling play()
         self.on_time_update: Optional[Callable[[float, float], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
-        self.on_end: Optional[Callable[[], None]] = None
+        self.on_end: Optional[Callable[[Optional[str]], None]] = None
+        # None = normal end (EOF/stop), str = error message for recovery
 
     # ------------------------------------------------------------------
     # Public API
@@ -47,6 +51,7 @@ class MpvPlayer:
                 idle=True,
             )
         except Exception as e:
+            log.exception("Failed to create mpv player")
             self._notify_error(f"Failed to create mpv player: {e}")
             return
 
@@ -71,14 +76,21 @@ class MpvPlayer:
         @player.event_callback("end-file")
         def _on_end_file(event):
             self.is_playing = False
+            error_msg: Optional[str] = None
+            # event.reason: 0=EOF, 1=STOP, 2=QUIT, 3=ERROR
+            if hasattr(event, "error") and event.error != 0:
+                error_msg = f"mpv error code {event.error}"
+            elif hasattr(event, "reason") and event.reason == 3:
+                error_msg = "Stream disconnected (seek past buffered range?)"
             if self.on_end:
-                self.on_end()
+                self.on_end(error_msg)
 
         # Start playback
         try:
             player.play(url)
             self.is_playing = True
         except Exception as e:
+            log.exception("Failed to start playback for URL: %.80s", url)
             self._notify_error(f"Failed to play: {e}")
             self._cleanup()
 
@@ -90,6 +102,11 @@ class MpvPlayer:
     def seek(self, seconds: float):
         if self._player:
             self._player.seek(seconds, reference="relative")
+
+    def seek_absolute(self, position: float):
+        """Seek to an absolute time position (seconds)."""
+        if self._player:
+            self._player.seek(position, reference="absolute")
 
     @property
     def volume(self) -> int:
@@ -136,7 +153,7 @@ class MpvPlayer:
                 try:
                     self._player.terminate()
                 except Exception:
-                    pass
+                    log.exception("Error during mpv terminate")
                 self._player = None
 
     def _notify_error(self, msg: str):
