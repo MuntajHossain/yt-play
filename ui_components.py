@@ -8,18 +8,24 @@ class SearchWidget(Static):
         yield Input(placeholder="Search YouTube...", id="search_input")
         yield Label("Press Enter to search", id="search_help")
 
+
 class ResultsWidget(Static):
     def compose(self) -> ComposeResult:
         yield Label("Search Results", id="results_title")
         yield OptionList(id="results_list")
-        
+
     def populate(self, results: list):
         option_list = self.query_one(OptionList)
         option_list.clear_options()
         for i, res in enumerate(results):
-            # Formatted text for each option
             text = f"{res.title} [{res.duration_str}] - {res.uploader}"
             option_list.add_option(Option(text, id=f"result_{i}"))
+
+    def show_loading(self, message: str):
+        self.query_one("#results_title", Label).update(message)
+
+    def show_count(self, count: int):
+        self.query_one("#results_title", Label).update(f"Search Results ({count})")
 
 class PlayerControlWidget(Static):
     def compose(self) -> ComposeResult:
