@@ -8,7 +8,7 @@ from textual.widgets import Header, Footer, Input, OptionList, Label, ProgressBa
 from textual.widgets.option_list import Option
 from textual import work
 
-from search import search_youtube, extract_audio_url
+from search import search_youtube, start_audio_download, wait_for_file_growth, DownloadHandle
 from player import MpvPlayer
 
 os.makedirs("log", exist_ok=True)
@@ -201,6 +201,9 @@ class YouTubePlayerApp(App):
 
         self._recovery_attempts: int = 0
         self.MAX_RECOVERY_ATTEMPTS: int = 3
+        self._desired_position: float = 0.0
+
+        self._active_download: Optional[DownloadHandle] = None
 
     # -- Navigation -------------------------------------------------------
 
@@ -208,11 +211,18 @@ class YouTubePlayerApp(App):
         self.push_screen(SearchScreen())
 
     def action_quit(self) -> None:
+        if isinstance(self.screen, (ResultsScreen, PlayerScreen)):
+            self.player.stop()
+            self._cleanup_active_download()
+            while not isinstance(self.screen, SearchScreen):
+                self.pop_screen()
+            return
+
         def _cb(result: bool) -> None:
             if result:
                 self.player.stop()
-                while not isinstance(self.screen, SearchScreen):
-                    self.pop_screen()
+                self._cleanup_active_download()
+                self.exit()
         self.push_screen(QuitScreen(), _cb)
 
     # -- Search -----------------------------------------------------------
@@ -240,32 +250,97 @@ class YouTubePlayerApp(App):
         self.current_youtube_url = result.url
         log.info("Playing [%d/%d]: %s (%s)", index + 1, len(self.results), result.title, result.url)
         self._recovery_attempts = 0
+        self._desired_position = 0.0
         self._play_video_async(result.url, result.title)
         self.push_screen(PlayerScreen())
 
     @work(exclusive=True)
     async def _play_video_async(self, url: str, title: str, seek_to: float = 0.0) -> None:
-        audio_url, err = await extract_audio_url(url)
-        if audio_url:
-            log.info("Audio URL resolved, starting playback (seek_to=%.1f)", seek_to)
-            self.player.play(audio_url)
-            if seek_to > 0:
-                log.info("Seeking to %.1fs after recovery", seek_to)
-                self.player.seek_absolute(seek_to)
-            player_screen = self.screen
-            if isinstance(player_screen, PlayerScreen):
-                player_screen.update_now_playing(title)
-        else:
-            log.error("Failed to get audio URL: %s", err)
-            self.notify(err or "Failed to load audio", title="Error", severity="error")
+        log.info("PLAY_VIDEO_ASYNC start: url=%s title=%s seek_to=%.1f", url, title, seek_to)
+
+        # Clean up any previous download before starting a new one.
+        self._cleanup_active_download()
+
+        handle, err = await start_audio_download(url)
+        if not handle:
+            log.error("PLAY_VIDEO_ASYNC failed to start download: %s", err)
+            self.notify(err or "Failed to start download", title="Error", severity="error")
             if isinstance(self.screen, PlayerScreen):
                 self.pop_screen()
+            return
+
+        self._active_download = handle
+
+        if not handle.file_path:
+            log.error("PLAY_VIDEO_ASYNC download file path never appeared on disk")
+            self.notify("Failed to locate downloaded file", title="Error", severity="error")
+            self._cleanup_active_download()
+            if isinstance(self.screen, PlayerScreen):
+                self.pop_screen()
+            return
+
+        log.info("PLAY_VIDEO_ASYNC waiting for initial buffer at %s", handle.file_path)
+        got_data = await wait_for_file_growth(handle.file_path, min_bytes=65536, timeout=15.0)
+
+        if handle.error:
+            log.error("PLAY_VIDEO_ASYNC download failed before playable: %s", handle.error)
+            self.notify(handle.error, title="Download Error", severity="error")
+            if isinstance(self.screen, PlayerScreen):
+                self.pop_screen()
+            return
+
+        if not got_data:
+            log.error("PLAY_VIDEO_ASYNC timed out waiting for download to produce data")
+            self.notify("Timed out starting download", title="Error", severity="error")
+            if isinstance(self.screen, PlayerScreen):
+                self.pop_screen()
+            return
+
+        log.info(
+            "PLAY_VIDEO_ASYNC starting mpv on local file (seek_to=%.1f): %s",
+            seek_to, handle.file_path,
+        )
+        self.player.play(handle.file_path)
+        if seek_to > 0:
+            log.info("PLAY_VIDEO_ASYNC issuing post-start absolute seek to %.1fs (recovery)", seek_to)
+            self.player.seek_absolute(seek_to)
+        else:
+            log.info("PLAY_VIDEO_ASYNC no post-start seek needed (seek_to=%.1f)", seek_to)
+        player_screen = self.screen
+        if isinstance(player_screen, PlayerScreen):
+            player_screen.update_now_playing(title)
+
+        # Let the download finish in the background; log its outcome.
+        await handle.wait()
+        if handle.error and handle is self._active_download:
+            log.error("PLAY_VIDEO_ASYNC background download ended with error: %s", handle.error)
+
+    def _cleanup_active_download(self) -> None:
+        """Kill any in-progress download and remove its temp file."""
+        handle = self._active_download
+        self._active_download = None
+        if not handle:
+            return
+        handle.kill()
+        if not handle.file_path:
+            return
+        try:
+            if os.path.exists(handle.file_path):
+                os.remove(handle.file_path)
+                log.info("CLEANUP removed temp file: %s", handle.file_path)
+        except OSError:
+            log.exception("CLEANUP failed to remove temp file: %s", handle.file_path)
 
     # -- Recovery ---------------------------------------------------------
 
     def _attempt_recovery(self) -> None:
+        log.info(
+            "RECOVERY entered: attempt=%d/%d desired_pos=%.1f last_reported_pos=%.1f url=%s",
+            self._recovery_attempts, self.MAX_RECOVERY_ATTEMPTS,
+            self._desired_position, self.player.current_time, self.current_youtube_url,
+        )
         if self._recovery_attempts >= self.MAX_RECOVERY_ATTEMPTS:
-            log.error("Max recovery attempts (%d) reached, giving up", self.MAX_RECOVERY_ATTEMPTS)
+            log.error("RECOVERY giving up: max attempts (%d) reached", self.MAX_RECOVERY_ATTEMPTS)
             self.notify("Playback failed after multiple retries", severity="error")
             self._recovery_attempts = 0
             if isinstance(self.screen, PlayerScreen):
@@ -273,12 +348,15 @@ class YouTubePlayerApp(App):
             return
 
         if not self.current_youtube_url or self.current_index < 0:
-            log.warning("No track info for recovery (url=%s, index=%d)", self.current_youtube_url, self.current_index)
+            log.warning("RECOVERY aborted: no track info (url=%s, index=%d)", self.current_youtube_url, self.current_index)
             return
 
         self._recovery_attempts += 1
-        last_position = self.player.current_time
-        log.info("Recovery attempt %d/%d — re-extracting URL, seek to %.1fs",
+        # Prefer the position the user was actually trying to reach (e.g. the
+        # target of a seek that ran past the buffer) over the last-reported
+        # current_time, which can lag behind a seek that failed immediately.
+        last_position = max(self.player.current_time, self._desired_position)
+        log.info("RECOVERY attempt %d/%d — re-extracting URL, will seek to %.1fs",
                  self._recovery_attempts, self.MAX_RECOVERY_ATTEMPTS, last_position)
         self._play_video_async(self.current_youtube_url, self.current_title, seek_to=last_position)
 
@@ -291,6 +369,7 @@ class YouTubePlayerApp(App):
             log.exception("_on_time_update call_from_thread failed")
 
     def _update_player_progress(self, current_time: float, duration: float) -> None:
+        self._desired_position = current_time
         ps = self.screen
         if isinstance(ps, PlayerScreen):
             ps.update_progress(current_time, duration)
@@ -309,11 +388,15 @@ class YouTubePlayerApp(App):
             log.exception("_on_track_end call_from_thread failed")
 
     def _handle_track_end(self, error_msg: Optional[str] = None) -> None:
+        log.info(
+            "TRACK_END handled: error_msg=%s pos=%.1f desired_pos=%.1f recovery_attempts=%d",
+            error_msg, self.player.current_time, self._desired_position, self._recovery_attempts,
+        )
         if error_msg:
-            log.error("Track ended with error: %s", error_msg)
+            log.error("TRACK_END with error -> starting recovery: %s", error_msg)
             self._attempt_recovery()
         else:
-            log.info("Track ended normally")
+            log.info("TRACK_END normal -> advancing")
             self._recovery_attempts = 0
             self._advance_to_next()
 
@@ -327,6 +410,7 @@ class YouTubePlayerApp(App):
             self.current_index = -1
             self.current_title = ""
             self.current_youtube_url = ""
+            self._cleanup_active_download()
             self.notify("Playback finished", timeout=2)
             if isinstance(self.screen, PlayerScreen):
                 self.pop_screen()
@@ -340,13 +424,21 @@ class YouTubePlayerApp(App):
 
     def action_seek_forward(self) -> None:
         if self.player.process:
+            self._desired_position = self.player.current_time + 5
+            log.info("USER ACTION: seek forward +5s requested (from pos=%.1f, desired=%.1f)",
+                      self.player.current_time, self._desired_position)
             self.player.seek(5)
-            log.info("Seek +5s (pos=%.1f)", self.player.current_time)
+        else:
+            log.info("USER ACTION: seek forward ignored, no active player")
 
     def action_seek_backward(self) -> None:
         if self.player.process:
+            self._desired_position = max(0.0, self.player.current_time - 5)
+            log.info("USER ACTION: seek backward -5s requested (from pos=%.1f, desired=%.1f)",
+                      self.player.current_time, self._desired_position)
             self.player.seek(-5)
-            log.info("Seek -5s (pos=%.1f)", self.player.current_time)
+        else:
+            log.info("USER ACTION: seek backward ignored, no active player")
 
     def action_volume_up(self) -> None:
         if self.player.process:

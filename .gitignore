@@ -12,3 +12,7 @@ wheels/
 # Project-specific
 .commandcode/
 plan.md
+
+# Runtime data & logs
+data/
+log/
