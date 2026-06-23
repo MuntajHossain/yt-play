@@ -27,17 +27,22 @@ log = logging.getLogger("yt-play")
 # ---------------------------------------------------------------------------
 
 class QuitScreen(ModalScreen[bool]):
-    """Keyboard-driven quit confirmation. Y / N / Escape."""
+    """Keyboard-driven confirmation. Y / N / Escape."""
     BINDINGS = [
         ("y", "yes", "Yes"),
         ("n", "no", "No"),
         ("escape", "no", "Cancel"),
     ]
+    def __init__(self, prompt: str = "Quit YouTube Player? (y/n)") -> None:
+        super().__init__()
+        self._prompt = prompt
     def compose(self) -> ComposeResult:
-        yield Label("Quit YouTube Player? (y/n)")
+        yield Label(self._prompt)
     def action_yes(self) -> None:
+        log.info("YES PRESSED")
         self.dismiss(True)
     def action_no(self) -> None:
+        log.info("NO PRESSED")
         self.dismiss(False)
 
 
@@ -211,19 +216,35 @@ class YouTubePlayerApp(App):
         self.push_screen(SearchScreen())
 
     def action_quit(self) -> None:
-        if isinstance(self.screen, (ResultsScreen, PlayerScreen)):
-            self.player.stop()
-            self._cleanup_active_download()
-            while not isinstance(self.screen, SearchScreen):
-                self.pop_screen()
+        if isinstance(self.screen, PlayerScreen):
+            def _cb(result: bool) -> None:
+                log.info("QUIT CALLBACK RESULT=%s", result)
+                log.info("CURRENT SCREEN=%s", type(self.screen).__name__)
+
+                if result:
+                    log.info("BEFORE player.stop()")
+                    # Disconnect on_end to prevent stop() → end-file →
+                    # _advance_to_next from pushing a new PlayerScreen
+                    # before we've popped the old one.
+                    self.player.on_end = None
+                    self.player.stop()
+                    log.info("AFTER player.stop()")
+
+                    log.info("BEFORE cleanup")
+                    self._cleanup_active_download()
+                    log.info("AFTER cleanup")
+
+                    while not isinstance(self.screen, ResultsScreen):
+                        log.info("POPPING %s", type(self.screen).__name__)
+                        self.pop_screen()
+
+                    log.info("DONE")
+            self.push_screen(QuitScreen("Stop playback and return to results? (y/n)"), _cb)
             return
 
-        def _cb(result: bool) -> None:
-            if result:
-                self.player.stop()
-                self._cleanup_active_download()
-                self.exit()
-        self.push_screen(QuitScreen(), _cb)
+        self.player.stop()
+        self._cleanup_active_download()
+        self.exit()
 
     # -- Search -----------------------------------------------------------
 
@@ -241,17 +262,33 @@ class YouTubePlayerApp(App):
     # -- Playback ---------------------------------------------------------
 
     def play_at(self, index: int) -> None:
+        log.info(
+            "PLAY_AT entered: index=%s current_screen=%s",
+            index,
+            type(self.screen).__name__,
+        )
         if index < 0 or index >= len(self.results):
+            log.warning(
+                "PLAY_AT invalid index=%s results=%s",
+                index,
+                len(self.results),
+            )
             log.warning("play_at: invalid index %d (results: %d)", index, len(self.results))
             return
         self.current_index = index
         result = self.results[index]
+        log.info(
+            "PLAY_AT selected title=%s",
+            result.title,
+        )
         self.current_title = result.title
         self.current_youtube_url = result.url
         log.info("Playing [%d/%d]: %s (%s)", index + 1, len(self.results), result.title, result.url)
         self._recovery_attempts = 0
         self._desired_position = 0.0
+        log.info("PLAY_AT starting download/play task")
         self._play_video_async(result.url, result.title)
+        log.info("PLAY_AT pushing PlayerScreen")
         self.push_screen(PlayerScreen())
 
     @work(exclusive=True)
@@ -394,19 +431,36 @@ class YouTubePlayerApp(App):
         )
         if error_msg:
             log.error("TRACK_END with error -> starting recovery: %s", error_msg)
+            log.info("HANDLE_TRACK_END -> recovery")
             self._attempt_recovery()
         else:
             log.info("TRACK_END normal -> advancing")
+            log.info("HANDLE_TRACK_END -> advance_to_next")
             self._recovery_attempts = 0
             self._advance_to_next()
 
     def _advance_to_next(self) -> None:
+        log.info(
+            "ADVANCE_TO_NEXT entered: current_index=%s results=%s current_screen=%s",
+            self.current_index,
+            len(self.results),
+            type(self.screen).__name__,
+        )
         next_index = self.current_index + 1
+        log.info(
+            "ADVANCE_TO_NEXT calculated next_index=%s",
+            next_index,
+        )
         if 0 <= next_index < len(self.results):
+            log.info(
+                "ADVANCE_TO_NEXT playing next track index=%s",
+                next_index,
+            )
             log.info("Advancing to next track [%d/%d]", next_index + 1, len(self.results))
             self.play_at(next_index)
         else:
             log.info("Queue exhausted — finished after %d tracks", len(self.results))
+            log.info("ADVANCE_TO_NEXT popping PlayerScreen")
             self.current_index = -1
             self.current_title = ""
             self.current_youtube_url = ""
