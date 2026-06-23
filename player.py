@@ -7,7 +7,7 @@ from typing import Callable, Optional
 log = logging.getLogger("yt-play")
 
 # Ensure libmpv DLL is findable
-os.environ["PATH"] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + os.environ.get("PATH", "")
+os.environ["PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mpv-lib") + os.pathsep + os.environ.get("PATH", "")
 
 import mpv
 
