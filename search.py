@@ -3,6 +3,7 @@ import glob
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -10,12 +11,73 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from config import CONFIG
+
 log = logging.getLogger("yt-play")
 
 # Downloaded audio files are stored here, relative to wherever the app is
 # run from (project root) - matches how main.py creates "log" relatively.
 DOWNLOAD_DIR = "data"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+def _extract_video_id(url: str) -> Optional[str]:
+    """Extract YouTube video ID from common URL formats."""
+    match = re.search(r"[?&]v=([a-zA-Z0-9_-]{11})", url)
+    if match:
+        return match.group(1)
+    match = re.search(r"youtu\.be/([a-zA-Z0-9_-]{11})", url)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _marker_path(video_id: str) -> str:
+    return os.path.join(DOWNLOAD_DIR, f"ytplay-{video_id}.done")
+
+
+def _check_cache(video_id: str) -> Optional[str]:
+    """Return cached file path if valid (.done marker + audio file exist), else None."""
+    marker = _marker_path(video_id)
+    if not os.path.exists(marker):
+        return None
+    pattern = os.path.join(DOWNLOAD_DIR, f"ytplay-{video_id}.*")
+    matches = [p for p in glob.glob(pattern) if not p.endswith(".done")]
+    if matches:
+        return matches[0]
+    # Stale marker — file was manually deleted.
+    os.remove(marker)
+    return None
+
+
+def _cleanup_cache() -> None:
+    """Delete cached files older than max_cache_age_hours."""
+    now = time.time()
+    cutoff = now - CONFIG.max_cache_age_hours * 3600
+    try:
+        for fname in os.listdir(DOWNLOAD_DIR):
+            fpath = os.path.join(DOWNLOAD_DIR, fname)
+            if not os.path.isfile(fpath) or not fname.startswith("ytplay-"):
+                continue
+            mtime = os.path.getmtime(fpath)
+            if mtime < cutoff:
+                os.remove(fpath)
+                log.info("CACHE cleanup removed old file: %s (age=%.1fh)", fname, (now - mtime) / 3600)
+    except OSError:
+        log.exception("CACHE cleanup error")
+
+
+def _remove_partial(video_id: str) -> None:
+    """Remove any partial download files for video_id (no .done marker)."""
+    pattern = os.path.join(DOWNLOAD_DIR, f"ytplay-{video_id}.*")
+    for fpath in glob.glob(pattern):
+        if fpath.endswith(".done"):
+            continue
+        try:
+            os.remove(fpath)
+            log.info("CACHE removed partial download: %s", fpath)
+        except OSError:
+            log.exception("CACHE failed to remove partial: %s", fpath)
 
 
 @dataclass
@@ -190,20 +252,26 @@ async def extract_audio_url(video_url: str) -> tuple[Optional[str], Optional[str
 class DownloadHandle:
     """Tracks a background yt-dlp download-to-file in progress."""
 
-    def __init__(self, process: "asyncio.subprocess.Process", dest_template: str, file_id: str):
+    def __init__(self, process: Optional["asyncio.subprocess.Process"], dest_template: str, file_id: str, video_id: str, is_cached: bool = False):
         self.process = process
         self.dest_template = dest_template
         self.file_id = file_id
+        self.video_id = video_id
         self.file_path: Optional[str] = None  # resolved once yt-dlp creates the real file
         self.started_at = time.monotonic()
-        self._done = False
+        self._done = is_cached
         self._error: Optional[str] = None
+        self._is_cached = is_cached
+
+    @property
+    def is_cached(self) -> bool:
+        return self._is_cached
 
     @property
     def is_done(self) -> bool:
         if self._done:
             return True
-        if self.process.returncode is not None:
+        if self.process is not None and self.process.returncode is not None:
             self._done = True
         return self._done
 
@@ -213,6 +281,8 @@ class DownloadHandle:
 
     async def wait(self) -> Optional[str]:
         """Wait for the download to finish. Returns an error string, or None on success."""
+        if self._is_cached:
+            return None
         _stdout, stderr = await self.process.communicate()
         self._done = True
         if self.process.returncode != 0:
@@ -221,10 +291,19 @@ class DownloadHandle:
             log.error("DOWNLOAD failed: %s", self._error)
         else:
             log.info("DOWNLOAD finished OK: %s", self.file_path)
+            # Mark as cached for future plays.
+            if self.video_id and self.file_path:
+                marker = _marker_path(self.video_id)
+                try:
+                    with open(marker, "w") as f:
+                        f.write(self.file_path)
+                    log.info("CACHE marker created: %s", marker)
+                except OSError:
+                    log.exception("CACHE failed to write marker: %s", marker)
         return self._error
 
     def kill(self):
-        if self.process.returncode is None:
+        if self.process is not None and self.process.returncode is None:
             try:
                 self.process.kill()
             except ProcessLookupError:
@@ -234,9 +313,15 @@ class DownloadHandle:
 async def start_audio_download(video_url: str) -> Tuple[Optional[DownloadHandle], Optional[str]]:
     """Start downloading *video_url*'s audio to a local temp file.
 
-    Returns ``(handle, None)`` on successful launch (download continues in the
-    background; check handle.is_done / await handle.wait() for completion),
-    or ``(None, error_msg)`` if the download could not even be started.
+    Checks the local cache first — if a completed download for this video
+    already exists, returns a cached handle immediately (no subprocess).
+
+    Otherwise starts yt-dlp as a background subprocess using the video's
+    YouTube ID for the filename, so subsequent plays can reuse the file.
+
+    Returns ``(handle, None)`` on success, ``(None, error_msg)`` on failure.
+    The returned handle may represent either a fresh download (check
+    handle.is_cached) or a cache hit.
 
     Important: this intentionally does NOT use --extract-audio/--audio-format,
     because those trigger an ffmpeg post-process step that only writes the
@@ -247,11 +332,31 @@ async def start_audio_download(video_url: str) -> Tuple[Optional[DownloadHandle]
     its original container, growing the file in real time as bytes arrive,
     so mpv can start reading from it almost immediately.
     """
-    file_id = uuid.uuid4().hex
+    # Prune expired entries before we touch the cache dir.
+    _cleanup_cache()
+
+    video_id = _extract_video_id(video_url)
+
+    # Check for a completed download.
+    if video_id:
+        cached = _check_cache(video_id)
+        if cached:
+            log.info("CACHE hit: video=%s file=%s", video_id, cached)
+            handle = DownloadHandle(None, cached, video_id, video_id, is_cached=True)
+            handle.file_path = cached
+            return handle, None
+
+        # Partial / abandoned download without .done marker — clean up.
+        _remove_partial(video_id)
+
+    # Fall back to UUID if we couldn't parse the video ID.
+    if not video_id:
+        video_id = uuid.uuid4().hex
+
     # %(ext)s resolves to the actual container yt-dlp downloads (m4a/webm/etc).
     # We discover the real path afterwards by globbing, since we don't know
     # the extension until the format is chosen.
-    dest_template = os.path.join(DOWNLOAD_DIR, f"ytplay-{file_id}.%(ext)s")
+    dest_template = os.path.join(DOWNLOAD_DIR, f"ytplay-{video_id}.%(ext)s")
 
     cmd = _ytdlp_cmd(
         "-f", AUDIO_FORMAT_SELECTOR,
@@ -272,26 +377,26 @@ async def start_audio_download(video_url: str) -> Tuple[Optional[DownloadHandle]
         log.exception("DOWNLOAD failed to launch yt-dlp")
         return None, f"Failed to start download: {e}"
 
-    handle = DownloadHandle(process, dest_template, file_id)
+    handle = DownloadHandle(process, dest_template, video_id, video_id)
     # Discover the real on-disk path (with actual extension) as soon as it appears.
-    found_path = await _wait_for_download_path(file_id, timeout=10.0)
+    found_path = await _wait_for_download_path(video_id, timeout=10.0)
     if found_path:
         handle.file_path = found_path
         log.info("DOWNLOAD file path resolved: %s", found_path)
     else:
-        log.warning("DOWNLOAD file not yet visible on disk after launch (file_id=%s)", file_id)
+        log.warning("DOWNLOAD file not yet visible on disk after launch (video_id=%s)", video_id)
 
     return handle, None
 
 
-async def _wait_for_download_path(file_id: str, timeout: float = 10.0) -> Optional[str]:
-    """Poll the download dir for the file yt-dlp actually created for *file_id*."""
+async def _wait_for_download_path(video_id: str, timeout: float = 10.0) -> Optional[str]:
+    """Poll the download dir for the file yt-dlp actually created for *video_id*."""
     deadline = time.monotonic() + timeout
-    pattern = os.path.join(DOWNLOAD_DIR, f"ytplay-{file_id}.*")
+    pattern = os.path.join(DOWNLOAD_DIR, f"ytplay-{video_id}.*")
     while time.monotonic() < deadline:
         matches = [
             p for p in glob.glob(pattern)
-            if not p.endswith(".part") and not p.endswith(".ytdl")
+            if not p.endswith(".part") and not p.endswith(".ytdl") and not p.endswith(".done")
         ]
         if matches:
             return matches[0]

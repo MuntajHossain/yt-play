@@ -356,7 +356,7 @@ class YouTubePlayerApp(App):
         """Kill any in-progress download and remove its temp file."""
         handle = self._active_download
         self._active_download = None
-        if not handle:
+        if not handle or handle.is_cached:
             return
         handle.kill()
         if not handle.file_path:
