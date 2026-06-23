@@ -18,7 +18,9 @@ A terminal-based YouTube audio player using `yt-dlp` to search and fetch audio s
 * [main.py](file:///c:/Users/hossa/Personal/Python/yt-play/main.py) - App orchestrator + 3 screen classes (Search, Results, Player).
 * [search.py](file:///c:/Users/hossa/Personal\Python\yt-play\search.py) - Async wrappers for running `yt-dlp` queries via `asyncio.create_subprocess_exec`.
 * [player.py](file:///c:/Users/hossa\Personal\Python\yt-play\player.py) - MpvPlayer class wrapping `python-mpv` (libmpv) for audio playback.
-* ~~[ui_components.py](file:///c:/Users/hossa\Personal\Python\yt-play\ui_components.py)~~ — **Deleted.** Widget logic moved into screen classes in `main.py`.
+* [config.py](file:///c:/Users/hossa/Personal\Python\yt-play\config.py) — Cache configuration (max age, dir).
+* [mpv-lib/](file:///c:/Users/hossa/Personal\Python\yt-play\mpv-lib/) — Contains `mpv-2.dll` (libmpv for python-mpv) and MinGW import libs.
+* ~~[ui_components.py](file:///c:/Users/hossa/Personal\Python\yt-play\ui_components.py)~~ — **Deleted.** Widget logic moved into screen classes in `main.py`.
 
 ## Architecture: 3-Screen Navigation
 
@@ -60,6 +62,32 @@ uv run main.py
 | `Esc` | Back to previous screen |
 
 Bindings are app-level, so playback controls work from any screen.
+
+## Audio Download Cache
+
+Audio files are cached locally using the YouTube video ID as the key. Files named `ytplay-{video_id}.{ext}` in `data/`. A `.done` marker file tracks completion.
+
+**Cache flow:**
+1. Before each download, prune files >7h old (`config.py` — `CacheConfig.max_cache_age_hours`)
+2. Extract `video_id` from URL, check if `ytplay-{video_id}.done` + audio file exist
+3. Cache hit → return handle with `is_cached=True`, no yt-dlp subprocess
+4. Partial file (no `.done` marker) → delete and re-download
+5. After download completes → write `.done` marker via `DownloadHandle.wait()`
+6. `main.py`'s `_cleanup_active_download()` skips cached files (doesn't delete them)
+
+**Config:** `config.py` — `CacheConfig` dataclass with `cache_dir` and `max_cache_age_hours`.
+
+## Resume Session (planned — not yet implemented)
+
+The plan (in `.commandcode/plans/yt-play-resume.md`) tracks:
+- Save state to `data/resume_state.json` on quit, track change, and every 15s during playback
+- On restart, show `[Ctrl+R] Resume: Song Title` on SearchScreen
+- Restores search results, auto-plays from saved position
+- Resume state >24h old is silently cleared on load
+
+## Known Quit Bug (fixed)
+
+Pressing `y` on quit modal from PlayerScreen previously triggered `end-file` → `_advance_to_next()` which pushed a new PlayerScreen before the old one was popped. Fix: disconnect `self.player.on_end = None` before `self.player.stop()` in the quit callback.
 
 ## Common Mistakes & Troubleshooting
 
@@ -104,10 +132,18 @@ Bindings are app-level, so playback controls work from any screen.
 6. **`push_screen` during playback** is fine — the player keeps playing in the background.
 7. **Quit binding** uses `QuitScreen` modal with `push_screen` + callback pattern.
 
+### When Using Config (config.py)
+1. **Import `CONFIG` singleton** — `from config import CONFIG`
+2. **Cache settings live in `CacheConfig`** — max age, cache dir, etc.
+3. **Don't hardcode cache paths** — use `CONFIG` values in search.py
+
 ### When Modifying Search Logic (search.py)
 1. **Use `asyncio.create_subprocess_exec`** for async yt-dlp calls.
 2. **`extract_audio_url` returns `(url, error)` tuple** — handle both values.
 3. **Error messages** are derived from stderr content. Keep the heuristics updated.
+4. **Files named `ytplay-{video_id}.{ext}`** — video_id from URL, not random UUID.
+5. **`.done` marker files** track completed downloads; partial files get deleted.
+6. **`_cleanup_cache()`** runs before every new download to purge old files.
 
 ### Important Notes
 - **Windows paths:** Use `os.pathsep` for PATH modifications in player.py for DLL loading.
