@@ -77,13 +77,17 @@ Audio files are cached locally using the YouTube video ID as the key. Files name
 
 **Config:** `config.py` — `CacheConfig` dataclass with `cache_dir` and `max_cache_age_hours`.
 
-## Resume Session (planned — not yet implemented)
+## Resume Session (implemented)
 
-The plan (in `.commandcode/plans/yt-play-resume.md`) tracks:
-- Save state to `data/resume_state.json` on quit, track change, and every 15s during playback
-- On restart, show `[Ctrl+R] Resume: Song Title` on SearchScreen
-- Restores search results, auto-plays from saved position
-- Resume state >24h old is silently cleared on load
+Playback position saved to `data/resume_state.json`:
+- On quit from PlayerScreen (via `action_quit()` callback)
+- Every 5s during playback (`_update_player_progress` timer)
+
+On next launch, if same video is selected from search results, position auto-restored. `_play_video_async()` checks `_resume_data` for matching `video_id`, overrides `seek_to`, and calls `self.player.play(path, seek_to=position)`.
+
+**Seek deferred to playback-restart:** Initial seek is deferred via `_pending_seek` in `MpvPlayer`. The `playback-restart` event callback applies `seek_absolute()` — avoids `MPV_ERROR_COMMAND (-12)` that fires when mpv is still loading the file.
+
+**State cleared** after successful resume apply (both `_resume_data` and the file).
 
 ## Known Quit Bug (fixed)
 
@@ -122,6 +126,7 @@ Pressing `y` on quit modal from PlayerScreen previously triggered `end-file` →
 3. **Always expose a `process` property** for `if self.player.process` guard checks in the app.
 4. **Use `_cleanup()` + lock** for safe teardown. MpvPlayer has a threading lock.
 5. **Register property observers** for `time-pos` and `duration`, and `end-file` event callback.
+6. **Defer initial seek to `playback-restart`** — `play(path, seek_to=N)` stores `_pending_seek` internally. The `playback-restart` event callback applies `seek_absolute()`. Never call `seek_absolute()` right after `play()`; mpv raises `MPV_ERROR_COMMAND (-12)` when still loading.
 
 ### When Modifying Screens (main.py)
 1. **Keep screens thin** — UI only. All logic lives on `YouTubePlayerApp`.
