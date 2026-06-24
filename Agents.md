@@ -168,6 +168,18 @@ dependencies = [
 
 ## Testing Commands
 ```bash
+# Install dev dependencies
+uv sync --dev
+
+# Run all tests
+uv run pytest -v
+
+# Run specific test file
+uv run pytest test/test_search.py -v
+
+# Run by keyword
+uv run pytest -k "extract_video_id"
+
 # Test yt-dlp connectivity
 yt-dlp "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
