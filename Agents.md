@@ -71,7 +71,7 @@ Audio files are cached locally using the YouTube video ID as the key. Files name
 1. Before each download, prune files >7h old (`config.py` — `CacheConfig.max_cache_age_hours`)
 2. Extract `video_id` from URL, check if `ytplay-{video_id}.done` + audio file exist
 3. Cache hit → return handle with `is_cached=True`, no yt-dlp subprocess
-4. Partial file (no `.done` marker) → delete and re-download
+4. Partial file (no `.done` marker) → delete and re-download 
 5. After download completes → write `.done` marker via `DownloadHandle.wait()`
 6. `main.py`'s `_cleanup_active_download()` skips cached files (doesn't delete them)
 

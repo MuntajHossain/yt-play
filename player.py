@@ -45,6 +45,7 @@ class MpvPlayer:
         self._watchdog_thread: Optional[threading.Thread] = None
         self._watchdog_stop = threading.Event()
         self._stall_reported = False
+        self._pending_seek: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -55,9 +56,15 @@ class MpvPlayer:
         """Whether a player instance is active."""
         return self._player is not None
 
-    def play(self, url: str):
-        """Start playing *url* (audio-only) through a new mpv instance."""
+    def play(self, url: str, seek_to: float = 0.0):
+        """Start playing *url* (audio-only) through a new mpv instance.
+
+        If *seek_to* > 0, the seek is deferred until mpv fires
+        playback-restart (avoids MPV_ERROR_COMMAND when mpv is still
+        loading the file).
+        """
         self.stop()
+        self._pending_seek = seek_to if seek_to > 0 else None
 
         try:
             self._player = mpv.MPV(
@@ -112,6 +119,15 @@ class MpvPlayer:
         @player.event_callback("playback-restart")
         def _on_playback_restart(event):
             log.info("MPV EVENT playback-restart: pos=%.1f cache=%s", self.current_time, self._cache_snapshot())
+            if self._pending_seek is not None and self._player:
+                target = self._pending_seek
+                self._pending_seek = None
+                log.info("PLAYBACK-RESTART: deferred absolute seek to %.1fs", target)
+                try:
+                    self._player.seek(target, reference="absolute")
+                    log.info("PLAYBACK-RESTART: deferred seek OK (target=%.1fs)", target)
+                except Exception:
+                    log.exception("PLAYBACK-RESTART: deferred seek failed (target=%.1fs)", target)
 
         # Log demuxer cache underrun (paused-for-cache) changes
         @player.property_observer("paused-for-cache")

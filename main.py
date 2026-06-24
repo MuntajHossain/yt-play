@@ -399,12 +399,7 @@ class YouTubePlayerApp(App):
             "PLAY_VIDEO_ASYNC starting mpv on local file (seek_to=%.1f): %s",
             seek_to, handle.file_path,
         )
-        self.player.play(handle.file_path)
-        if seek_to > 0:
-            log.info("PLAY_VIDEO_ASYNC issuing post-start absolute seek to %.1fs (recovery)", seek_to)
-            self.player.seek_absolute(seek_to)
-        else:
-            log.info("PLAY_VIDEO_ASYNC no post-start seek needed (seek_to=%.1f)", seek_to)
+        self.player.play(handle.file_path, seek_to=seek_to)
         player_screen = self.screen
         if isinstance(player_screen, PlayerScreen):
             player_screen.update_now_playing(title)
@@ -472,9 +467,9 @@ class YouTubePlayerApp(App):
         ps = self.screen
         if isinstance(ps, PlayerScreen):
             ps.update_progress(current_time, duration)
-        # Persist position every 15s for resume on crash/quit.
+        # Persist position every 5s for resume on crash/quit.
         now = time.monotonic()
-        if now - self._last_pos_save > 15.0:
+        if now - self._last_pos_save > 5.0:
             self._save_resume_data()
             self._last_pos_save = now
 
