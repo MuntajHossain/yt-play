@@ -342,7 +342,7 @@ class YouTubePlayerApp(App):
         log.info("PLAY_AT pushing PlayerScreen")
         self.push_screen(PlayerScreen())
 
-    @work(exclusive=True)
+    @work
     async def _play_video_async(self, url: str, title: str, seek_to: float = 0.0) -> None:
         log.info("PLAY_VIDEO_ASYNC start: url=%s title=%s seek_to=%.1f", url, title, seek_to)
 

@@ -37,7 +37,7 @@ The app uses Textual's `push_screen`/`pop_screen` stack:
 - **ResultsScreen** — Displays `OptionList` of search results. `Esc` pops back to search. Selection calls `app.play_at()`.
 - **PlayerScreen** — Shows now-playing title, progress bar with time labels, controls help. Live updates from player callbacks.
 - **QuitScreen** — Modal confirmation (`Ctrl+D`). Extends `ModalScreen[bool]`.
-- `@work(exclusive=True)` decorators on async methods that dispatch background work (`do_search`, `_play_video_async`). These return `Worker` objects — do **not** `await` them.
+- **`@work` decorators** on async methods that dispatch background work (`do_search`, `_play_video_async`). These return `Worker` objects — do **not** `await` them. `do_search` uses `exclusive=True` (concurrent searches wasteful). `_play_video_async` intentionally avoids `exclusive=True` so N/P next/prev track works — old download cleaned up via `_cleanup_active_download()` inside the method.
 
 ## Setup & Installation
 ```bash
@@ -133,7 +133,7 @@ Pressing `y` on quit modal from PlayerScreen previously triggered `end-file` →
 2. **Use `self.app` with type: ignore** to access app methods from screens.
 3. **Callbacks from player thread** must use `self.call_from_thread()` to update screen widgets.
 4. **Check `isinstance(self.screen, PlayerScreen)`** before updating player UI — it may have been popped.
-5. **`@work(exclusive=True)` methods** return `Worker`, not awaitable. Call without `await`.
+5. **`@work` methods** return `Worker`, not awaitable. Call without `await`.
 6. **`push_screen` during playback** is fine — the player keeps playing in the background.
 7. **Quit binding** uses `QuitScreen` modal with `push_screen` + callback pattern.
 
@@ -155,6 +155,7 @@ Pressing `y` on quit modal from PlayerScreen previously triggered `end-file` →
 - **Screen stack:** Textual's screen stack is used naturally. `pop_screen()` pops to the previous screen.
 - **`current_index = -1`** means "no track playing." The guard `0 <= next_index < len(results)` handles auto-advance correctly from this state.
 - **`_advance_to_next`** pops PlayerScreen back to ResultsScreen when queue is exhausted.
+- **Git add on Windows:** Match filename case exactly from `git status` output. `git add AGENTS.md` may silently no-op if the real file is `Agents.md`.
 
 ## Dependencies (pyproject.toml)
 ```toml
