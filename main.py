@@ -1,5 +1,7 @@
+import json
 import logging
 import os
+import time
 from typing import Optional
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -8,7 +10,7 @@ from textual.widgets import Header, Footer, Input, OptionList, Label, ProgressBa
 from textual.widgets.option_list import Option
 from textual import work
 
-from search import search_youtube, start_audio_download, wait_for_file_growth, DownloadHandle
+from search import search_youtube, start_audio_download, wait_for_file_growth, DownloadHandle, _extract_video_id
 from player import MpvPlayer
 
 os.makedirs("log", exist_ok=True)
@@ -210,10 +212,58 @@ class YouTubePlayerApp(App):
 
         self._active_download: Optional[DownloadHandle] = None
 
+        self._resume_path = os.path.join("data", "resume_state.json")
+        self._resume_data: Optional[dict] = self._load_resume_data()
+        self._last_pos_save: float = 0.0
+
     # -- Navigation -------------------------------------------------------
 
     def on_mount(self) -> None:
         self.push_screen(SearchScreen())
+
+    # -- Resume position --------------------------------------------------
+
+    def _load_resume_data(self) -> Optional[dict]:
+        """Load saved resume position from disk."""
+        try:
+            if os.path.exists(self._resume_path):
+                with open(self._resume_path) as f:
+                    return json.load(f)
+        except Exception:
+            log.exception("Failed to load resume data")
+        return None
+
+    def _save_resume_data(self) -> None:
+        """Save current position to disk for resume on next play."""
+        if not self.current_youtube_url or self.current_index < 0:
+            return
+        vid = _extract_video_id(self.current_youtube_url)
+        if not vid:
+            return
+        data = {
+            "video_id": vid,
+            "title": self.current_title,
+            "url": self.current_youtube_url,
+            "position": self._desired_position,
+            "duration": self.player.duration,
+            "saved_at": time.time(),
+        }
+        try:
+            with open(self._resume_path, "w") as f:
+                json.dump(data, f)
+            log.info("RESUME saved: %s at %.1fs", vid, self._desired_position)
+        except Exception:
+            log.exception("Failed to save resume data")
+
+    def _clear_resume_file(self) -> None:
+        try:
+            if os.path.exists(self._resume_path):
+                os.remove(self._resume_path)
+                log.info("RESUME cleared")
+        except OSError:
+            log.exception("Failed to clear resume file")
+
+    # -- Navigation -------------------------------------------------------
 
     def action_quit(self) -> None:
         if isinstance(self.screen, PlayerScreen):
@@ -223,6 +273,7 @@ class YouTubePlayerApp(App):
 
                 if result:
                     log.info("BEFORE player.stop()")
+                    self._save_resume_data()
                     # Disconnect on_end to prevent stop() → end-file →
                     # _advance_to_next from pushing a new PlayerScreen
                     # before we've popped the old one.
@@ -294,6 +345,17 @@ class YouTubePlayerApp(App):
     @work(exclusive=True)
     async def _play_video_async(self, url: str, title: str, seek_to: float = 0.0) -> None:
         log.info("PLAY_VIDEO_ASYNC start: url=%s title=%s seek_to=%.1f", url, title, seek_to)
+
+        # Check saved resume position — override seek_to if this is the same video.
+        if seek_to == 0.0 and self._resume_data:
+            rid = self._resume_data.get("video_id")
+            if rid and rid == _extract_video_id(url):
+                seek_to = self._resume_data["position"]
+                pos_str = PlayerScreen._fmt(seek_to)
+                self.notify(f"Resumed at {pos_str}", timeout=3)
+                self._resume_data = None
+                self._clear_resume_file()
+                log.info("RESUME applied: %s at %.1fs", rid, seek_to)
 
         # Clean up any previous download before starting a new one.
         self._cleanup_active_download()
@@ -410,6 +472,11 @@ class YouTubePlayerApp(App):
         ps = self.screen
         if isinstance(ps, PlayerScreen):
             ps.update_progress(current_time, duration)
+        # Persist position every 15s for resume on crash/quit.
+        now = time.monotonic()
+        if now - self._last_pos_save > 15.0:
+            self._save_resume_data()
+            self._last_pos_save = now
 
     def _on_player_error(self, message: str) -> None:
         log.error("Player error: %s", message)

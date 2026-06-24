@@ -10,7 +10,7 @@ class CacheConfig:
         max_cache_age_hours: Delete cached files older than this.
     """
     cache_dir: str = "data"
-    max_cache_age_hours: float = 7.0
+    max_cache_age_hours: float = 7.0*24
 
 
 CONFIG = CacheConfig()
