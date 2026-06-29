@@ -8,6 +8,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Header, Footer, Input, OptionList, Label, ProgressBar
 from textual.widgets.option_list import Option
+from textual.binding import Binding
 from textual import work
 
 from search import search_youtube, start_audio_download, wait_for_file_growth, DownloadHandle, _extract_video_id
@@ -22,6 +23,17 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("yt-play")
+
+
+# ---------------------------------------------------------------------------
+# Widgets
+# ---------------------------------------------------------------------------
+
+class SearchInput(Input):
+    BINDINGS = [
+        # Unbind ctrl+d so it bubbles up to app-level quit.
+        Binding("ctrl+d", "", "", show=False, priority=True),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +75,7 @@ class SearchScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical():
-            yield Input(placeholder="Search YouTube...", id="search_input")
+            yield SearchInput(placeholder="Search YouTube...", id="search_input")
             yield Label("Press Enter to search", id="search_status")
         yield Footer()
 
