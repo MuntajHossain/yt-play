@@ -221,26 +221,55 @@ class YouTubePlayerApp(App):
     def on_mount(self) -> None:
         self.push_screen(SearchScreen())
 
-    # -- Resume position --------------------------------------------------
+    # -- Resume / play history -------------------------------------------
+
+    MAX_HISTORY = 200
 
     def _load_resume_data(self) -> Optional[dict]:
-        """Load saved resume position from disk."""
+        """Load play history, return last entry for resume (or None)."""
         try:
             if os.path.exists(self._resume_path):
                 with open(self._resume_path) as f:
-                    return json.load(f)
+                    data = json.load(f)
+                # Old format — single dict → migrate to array
+                if isinstance(data, dict):
+                    data = [data]
+                    self._write_history(data)
+                if isinstance(data, list) and data:
+                    return data[-1]
         except Exception:
             log.exception("Failed to load resume data")
         return None
 
+    def _read_history(self) -> list:
+        """Read full history array from disk."""
+        try:
+            if os.path.exists(self._resume_path):
+                with open(self._resume_path) as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict):
+                    return [data]
+        except Exception:
+            log.exception("Failed to read history")
+        return []
+
+    def _write_history(self, entries: list) -> None:
+        try:
+            with open(self._resume_path, "w") as f:
+                json.dump(entries, f, indent=2)
+        except Exception:
+            log.exception("Failed to write history")
+
     def _save_resume_data(self) -> None:
-        """Save current position to disk for resume on next play."""
+        """Upsert current position into play history — one entry per video_id."""
         if not self.current_youtube_url or self.current_index < 0:
             return
         vid = _extract_video_id(self.current_youtube_url)
         if not vid:
             return
-        data = {
+        entry = {
             "video_id": vid,
             "title": self.current_title,
             "url": self.current_youtube_url,
@@ -248,20 +277,23 @@ class YouTubePlayerApp(App):
             "duration": self.player.duration,
             "saved_at": time.time(),
         }
-        try:
-            with open(self._resume_path, "w") as f:
-                json.dump(data, f)
-            log.info("RESUME saved: %s at %.1fs", vid, self._desired_position)
-        except Exception:
-            log.exception("Failed to save resume data")
+        history = self._read_history()
+        # Replace existing entry for same video_id, or append
+        for i, e in enumerate(history):
+            if e.get("video_id") == vid:
+                history[i] = entry
+                break
+        else:
+            history.append(entry)
+        # Trim oldest if over limit
+        if len(history) > self.MAX_HISTORY:
+            history = history[-self.MAX_HISTORY:]
+        self._write_history(history)
+        log.info("HISTORY upserted: %s at %.1fs (%d entries)", vid, self._desired_position, len(history))
 
     def _clear_resume_file(self) -> None:
-        try:
-            if os.path.exists(self._resume_path):
-                os.remove(self._resume_path)
-                log.info("RESUME cleared")
-        except OSError:
-            log.exception("Failed to clear resume file")
+        """Clear in-memory resume state. History file kept for reference."""
+        pass
 
     # -- Navigation -------------------------------------------------------
 
