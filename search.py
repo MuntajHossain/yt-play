@@ -303,10 +303,24 @@ class DownloadHandle:
         return self._error
 
     def kill(self):
-        if self.process is not None and self.process.returncode is None:
+        p = self.process
+        if p is not None and p.returncode is None:
             try:
-                self.process.kill()
+                p.kill()
             except ProcessLookupError:
+                pass
+        # Drain pipes to prevent "unclosed transport" warnings on Windows (Python 3.14+).
+        if p is not None:
+            for stream in (p.stdout, p.stderr):
+                if stream is None:
+                    continue
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                p.wait()
+            except Exception:
                 pass
 
 

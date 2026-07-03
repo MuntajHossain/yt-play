@@ -126,6 +126,68 @@ class ResultsScreen(Screen):
             self.app.pop_screen()
 
 
+class SeekModal(ModalScreen[float]):
+    """Input modal to seek to a specific timestamp. Dismisses with seconds or None."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, duration: float) -> None:
+        super().__init__()
+        self._duration = duration
+        self._max_str = PlayerScreen._fmt(duration)
+
+    def compose(self) -> ComposeResult:
+        yield Label(f"Seek to position (max [bold]{self._max_str}[/]):", id="seek_label")
+        yield Input(placeholder="e.g. 1:30:40, 5:30, 90", id="seek_input")
+        yield Label("", id="seek_error")
+
+    def on_mount(self) -> None:
+        self.query_one("#seek_input", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        raw = event.input.value.strip()
+        seconds = self._parse_timestamp(raw)
+        if seconds is None:
+            self.query_one("#seek_error", Label).update(
+                f"[red]Invalid format. Use H:MM:SS, M:SS, or plain seconds.[/]"
+            )
+            return
+        if seconds < 0:
+            seconds = 0
+        if seconds > self._duration:
+            self.query_one("#seek_error", Label).update(
+                f"[red]Position {PlayerScreen._fmt(seconds)} exceeds duration ({self._max_str}). "
+                f"Max is {PlayerScreen._fmt(self._duration)}.[/]"
+            )
+            return
+        self.dismiss(seconds)
+
+    @staticmethod
+    def _parse_timestamp(raw: str) -> Optional[float]:
+        """Parse H:MM:SS, M:SS, or plain seconds. Returns None on failure."""
+        raw = raw.strip()
+        if not raw:
+            return None
+        parts = raw.split(":")
+        try:
+            if len(parts) == 3:
+                h, m, s = parts
+                return int(h) * 3600 + int(m) * 60 + float(s)
+            elif len(parts) == 2:
+                m, s = parts
+                return int(m) * 60 + float(s)
+            elif len(parts) == 1:
+                return float(parts[0])
+        except ValueError:
+            pass
+        return None
+
+
 class PlayerScreen(Screen):
     CSS = """
     PlayerScreen { layout: vertical; }
@@ -145,7 +207,7 @@ class PlayerScreen(Screen):
             yield Label("00:00", id="time_total")
         yield Label(
             "[Space] Play/Pause  [Left/Right] Seek ±5s  [Up/Down] Vol ±5  "
-            "[N]ext  [P]rev  [[/]] Speed ∓0.25  [Esc] Back  [Ctrl+D] Quit",
+            "[G]o to position  [N]ext  [P]rev  [[/]] Speed ∓0.25  [Esc] Back  [Ctrl+D] Quit",
             id="controls_help",
         )
         yield Footer()
@@ -200,6 +262,7 @@ class YouTubePlayerApp(App):
         ("left", "seek_backward", "Seek -5s"),
         ("up", "volume_up", "Vol +5"),
         ("down", "volume_down", "Vol -5"),
+        ("g", "go_to_position", "Go to position"),
         ("n", "next_track", "Next"),
         ("p", "prev_track", "Prev"),
         ("]", "speed_up", "Speed +"),
@@ -576,6 +639,26 @@ class YouTubePlayerApp(App):
                 self.pop_screen()
 
     # -- Keyboard actions -------------------------------------------------
+
+    def action_go_to_position(self) -> None:
+        if isinstance(self.screen, SeekModal):
+            return
+        if not self.player.process:
+            self.notify("Nothing playing", title="Seek", timeout=2)
+            return
+        duration = self.player.duration
+        if duration <= 0:
+            self.notify("Track duration unknown yet", title="Seek", timeout=2)
+            return
+
+        def _on_seek(pos: Optional[float]) -> None:
+            if pos is not None:
+                self._desired_position = pos
+                log.info("USER ACTION: go to position %.1fs", pos)
+                self.player.seek_absolute(pos)
+                self.notify(f"Seeked to {PlayerScreen._fmt(pos)}", timeout=2)
+
+        self.push_screen(SeekModal(duration), _on_seek)
 
     def action_toggle_pause(self) -> None:
         if self.player.process:
