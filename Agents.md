@@ -15,10 +15,11 @@ A terminal-based YouTube audio player using `yt-dlp` to search and fetch audio s
   * `mpv` - External binary; must be on PATH.
 
 ## Project Structure
-* [main.py](file:///c:/Users/hossa/Personal/Python/yt-play/main.py) - App orchestrator + 3 screen classes (Search, Results, Player).
+* [main.py](file:///c:/Users/hossa/Personal/Python/yt-play/main.py) - App orchestrator + 4 screen/modal classes (Search, Results, Player, SeekModal).
 * [search.py](file:///c:/Users/hossa/Personal\Python\yt-play\search.py) - Async wrappers for running `yt-dlp` queries via `asyncio.create_subprocess_exec`.
 * [player.py](file:///c:/Users/hossa\Personal\Python\yt-play\player.py) - MpvPlayer class wrapping `python-mpv` (libmpv) for audio playback.
 * [config.py](file:///c:/Users/hossa/Personal\Python\yt-play\config.py) — Cache configuration (max age, dir).
+* [.vscode/settings.json](file:///c:/Users/hossa/Personal/Python/yt-play/.vscode/settings.json) — Workspace settings (disables auto venv activation).
 * [mpv-lib/](file:///c:/Users/hossa/Personal\Python\yt-play\mpv-lib/) — Contains `mpv-2.dll` (libmpv for python-mpv) and MinGW import libs.
 * ~~[ui_components.py](file:///c:/Users/hossa/Personal\Python\yt-play\ui_components.py)~~ — **Deleted.** Widget logic moved into screen classes in `main.py`.
 
@@ -37,6 +38,7 @@ The app uses Textual's `push_screen`/`pop_screen` stack:
 - **ResultsScreen** — Displays `OptionList` of search results. `Esc` pops back to search. Selection calls `app.play_at()`.
 - **PlayerScreen** — Shows now-playing title, progress bar with time labels, controls help. Live updates from player callbacks.
 - **QuitScreen** — Modal confirmation (`Ctrl+D`). Extends `ModalScreen[bool]`.
+- **SeekModal** — Input modal to seek to exact timestamp (`g` key). Accepts H:MM:SS, M:SS, or seconds. Validates against track duration.
 - **`@work` decorators** on async methods that dispatch background work (`do_search`, `_play_video_async`). These return `Worker` objects — do **not** `await` them. `do_search` uses `exclusive=True` (concurrent searches wasteful). `_play_video_async` intentionally avoids `exclusive=True` so N/P next/prev track works — old download cleaned up via `_cleanup_active_download()` inside the method.
 
 ## Setup & Installation
@@ -56,6 +58,7 @@ uv run main.py
 | `Ctrl+D` | Quit (with confirmation) — avoids VS Code `Ctrl+Q` conflict |
 | `Space` | Play / Pause |
 | `Left / Right` | Seek ±5s |
+| `G` | Go to position (H:MM:SS, M:SS, or seconds) |
 | `Up / Down` | Volume ±5 |
 | `N / P` | Next / Previous track |
 | `[ / ]` | Speed ∓0.25x (range 0.25–3.0) |
@@ -136,6 +139,7 @@ Pressing `y` on quit modal from PlayerScreen previously triggered `end-file` →
 5. **`@work` methods** return `Worker`, not awaitable. Call without `await`.
 6. **`push_screen` during playback** is fine — the player keeps playing in the background.
 7. **Quit binding** uses `QuitScreen` modal with `push_screen` + callback pattern.
+8. **SeekModal (`g` key)** — `push_screen(SeekModal(duration), callback)`. Modal parses H:MM:SS/M:SS/seconds, validates against duration, dismisses with float or None. Callback calls `player.seek_absolute()`. Guard with `isinstance(self.screen, SeekModal)` to prevent re-entry.
 
 ### When Using Config (config.py)
 1. **Import `CONFIG` singleton** — `from config import CONFIG`
@@ -149,6 +153,7 @@ Pressing `y` on quit modal from PlayerScreen previously triggered `end-file` →
 4. **Files named `ytplay-{video_id}.{ext}`** — video_id from URL, not random UUID.
 5. **`.done` marker files** track completed downloads; partial files get deleted.
 6. **`_cleanup_cache()`** runs before every new download to purge old files.
+7. **Drain subprocess pipes in `DownloadHandle.kill()`** — close stdout/stderr streams + `p.wait()` after killing. Prevents "unclosed transport" `ValueError: I/O operation on closed pipe` warnings on Windows (Python 3.14+ raises on pipe fileno after close).
 
 ### Important Notes
 - **Windows paths:** Use `os.pathsep` for PATH modifications in player.py for DLL loading.
