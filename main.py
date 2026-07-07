@@ -64,29 +64,132 @@ class QuitScreen(ModalScreen[bool]):
 # Screens
 # ---------------------------------------------------------------------------
 
+class MenuScreen(Screen):
+    """Entry point: choose Play History or Search."""
+
+    CSS = """
+    MenuScreen { align: center middle; }
+    MenuScreen Vertical { width: 40; height: auto; margin: 1; }
+    #menu_title { text-align: center; text-style: bold; padding-bottom: 1; }
+    #menu_list { margin-top: 1; height: 4; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical():
+            yield Label("YouTube Player", id="menu_title")
+            yield OptionList(id="menu_list")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        menu = self.query_one("#menu_list", OptionList)
+        menu.add_option(Option("▶  Play History", id="menu_history"))
+        menu.add_option(Option("🔍  Search", id="menu_search"))
+        menu.focus()
+
+    async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        app: YouTubePlayerApp = self.app  # type: ignore
+        if event.option_id == "menu_history":
+            app.go_to_history()
+        elif event.option_id == "menu_search":
+            app.go_to_search()
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.app.exit()
+
+
+class HistoryScreen(Screen):
+    """Show play history; select to play (downloads if not cached)."""
+
+    CSS = """
+    HistoryScreen { layout: vertical; }
+    #history_title { padding: 0 1; }
+    #history_list { height: 1fr; }
+    #history_empty { padding: 1; text-align: center; text-style: dim; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Label("Play History", id="history_title")
+        yield OptionList(id="history_list")
+        yield Label("No play history yet", id="history_empty")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        app: YouTubePlayerApp = self.app  # type: ignore
+        history = app._read_history()
+        option_list = self.query_one("#history_list", OptionList)
+        empty_label = self.query_one("#history_empty", Label)
+        if not history:
+            option_list.display = False
+            empty_label.display = True
+            return
+        empty_label.display = False
+        option_list.display = True
+        # Newest first
+        for i, entry in enumerate(reversed(history)):
+            title = entry.get("title", "Unknown")
+            position = entry.get("position", 0.0)
+            label = f"{title}"
+            if position > 0:
+                label += f"  [{PlayerScreen._fmt(position)}]"
+            option_list.add_option(Option(label, id=f"hist_{i}"))
+        option_list.focus()
+
+    async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        app: YouTubePlayerApp = self.app  # type: ignore
+        app.play_history_entry(event.option_index)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.app.pop_screen()
+
+
 class SearchScreen(Screen):
     CSS = """
     SearchScreen { align: center middle; }
     SearchScreen > Vertical { width: 60; height: auto; }
     Input { margin-bottom: 1; }
     Label { text-align: center; }
+    #recent_searches { margin-top: 1; height: auto; }
     """
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical():
-            yield SearchInput(placeholder="Search YouTube...", id="search_input")
+            yield SearchInput(placeholder="Search YouTube... ($0 = repeat last)", id="search_input")
             yield Label("Press Enter to search", id="search_status")
+            yield Label("", id="recent_searches")
         yield Footer()
 
     def on_mount(self) -> None:
         self.query_one(Input).focus()
+        app: YouTubePlayerApp = self.app  # type: ignore
+        if app.recent_searches:
+            lines = ["[bold]Recent:[/]"] + [f"  • {q}" for q in app.recent_searches]
+            self.query_one("#recent_searches", Label).update("\n".join(lines))
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "search_input" and event.input.value:
-            self.query_one("#search_status", Label).update("Searching...")
-            app: YouTubePlayerApp = self.app  # type: ignore
-            app.do_search(event.input.value)
+        if event.input.id != "search_input":
+            return
+        value = event.input.value.strip()
+        if not value:
+            return
+        app: YouTubePlayerApp = self.app  # type: ignore
+        if value == "$0":
+            if not app.recent_searches:
+                self.query_one("#search_status", Label).update("No recent search to repeat")
+                return
+            self.query_one("#search_status", Label).update("Repeating last search...")
+            app.do_search(app.recent_searches[0], auto_play_first=True)
+            return
+        self.query_one("#search_status", Label).update("Searching...")
+        app.do_search(value)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.app.pop_screen()
 
 
 class ResultsScreen(Screen):
@@ -291,10 +394,68 @@ class YouTubePlayerApp(App):
         self._resume_data: Optional[dict] = self._load_resume_data()
         self._last_pos_save: float = 0.0
 
+        self.recent_searches: list = []  # max 10, newest first
+
     # -- Navigation -------------------------------------------------------
 
     def on_mount(self) -> None:
+        self.push_screen(MenuScreen())
+
+    def go_to_history(self) -> None:
+        self.push_screen(HistoryScreen())
+
+    def go_to_search(self) -> None:
         self.push_screen(SearchScreen())
+
+    def play_history_entry(self, index: int) -> None:
+        """Play from history: newest=0. If cached, play directly; else download."""
+        history = self._read_history()
+        if not history:
+            self.notify("No history entries", timeout=2)
+            return
+        # history list reversed in screen — reverse back
+        reversed_history = list(reversed(history))
+        if index < 0 or index >= len(reversed_history):
+            return
+        entry = reversed_history[index]
+        video_id = entry.get("video_id")
+        title = entry.get("title", "Unknown")
+        url = entry.get("url", "")
+        position = entry.get("position", 0.0)
+
+        if not url:
+            self.notify("No URL in history entry", title="Error", severity="error")
+            return
+
+        from search import _check_cache, _extract_video_id
+        vid = video_id or _extract_video_id(url)
+
+        # Check if cached — play directly
+        if vid:
+            cached = _check_cache(vid)
+            if cached:
+                log.info("HISTORY play: cached hit for %s (%s)", vid, title)
+                self.current_index = -1
+                self.current_title = title
+                self.current_youtube_url = url
+                self._recovery_attempts = 0
+                self._desired_position = position
+                self._cleanup_active_download()
+                self.push_screen(PlayerScreen())
+                self._play_video_async(url, title, seek_to=position)
+                return
+
+        # Not cached — treat like search result (downloads)
+        if url:
+            log.info("HISTORY play: downloading %s (%s)", vid, title)
+            self.results = []  # clear search results
+            self.current_index = 0
+            self.current_title = title
+            self.current_youtube_url = url
+            self._recovery_attempts = 0
+            self._desired_position = position
+            self.push_screen(PlayerScreen())
+            self._play_video_async(url, title, seek_to=position)
 
     # -- Resume / play history -------------------------------------------
 
@@ -407,15 +568,24 @@ class YouTubePlayerApp(App):
     # -- Search -----------------------------------------------------------
 
     @work(exclusive=True)
-    async def do_search(self, query: str) -> None:
-        log.info("Searching: %s", query)
+    async def do_search(self, query: str, auto_play_first: bool = False) -> None:
+        log.info("Searching: %s (auto_play=%s)", query, auto_play_first)
         self.results = await search_youtube(query)
         log.info("Search returned %d results", len(self.results))
         self.current_index = -1
         self.current_title = ""
         self.current_youtube_url = ""
         self._recovery_attempts = 0
-        self.push_screen(ResultsScreen())
+        # Track recent searches (max 10, deduplicate)
+        if query in self.recent_searches:
+            self.recent_searches.remove(query)
+        self.recent_searches.insert(0, query)
+        if len(self.recent_searches) > 10:
+            self.recent_searches = self.recent_searches[:10]
+        if auto_play_first and self.results:
+            self.play_at(0)
+        else:
+            self.push_screen(ResultsScreen())
 
     # -- Playback ---------------------------------------------------------
 

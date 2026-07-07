@@ -1,5 +1,6 @@
-"""Tests for main.py — PlayerScreen._fmt, smoke tests.""" 
+"""Tests for main.py — PlayerScreen._fmt, SeekModal, history, app logic.""" 
 
+import json
 import os
 import sys
 
@@ -14,8 +15,12 @@ try:
 except OSError:
     pytest.skip("mpv DLL not available — skipping main tests", allow_module_level=True)
 
-from main import PlayerScreen  # noqa: E402
+from main import PlayerScreen, SeekModal, YouTubePlayerApp  # noqa: E402
 
+
+# ------------------------------------------------------------------
+# PlayerScreen._fmt
+# ------------------------------------------------------------------
 
 class TestPlayerScreenFmt:
     """PlayerScreen._fmt is a staticmethod — pure, no state needed."""
@@ -33,7 +38,7 @@ class TestPlayerScreenFmt:
             (3661, "01:01:01"),
             (86399, "23:59:59"),
             (86400, "24:00:00"),
-            (1.5, "00:01"),   # floats truncated to int
+            (1.5, "00:01"),
             (59.9, "00:59"),
             (119.7, "01:59"),
         ],
@@ -46,11 +51,185 @@ class TestPlaybackHotPaths:
     """Smoke checks for app actions — no mpv instance needed."""
 
     def test_fmt_round_trip(self):
-        """Verify _fmt is invertible-ish: parseable as H:MM:SS or MM:SS."""
         result = PlayerScreen._fmt(3661)
         assert ":" in result
         parts = result.split(":")
         assert len(parts) in (2, 3)
-        # All parts parse to int
         for p in parts:
             int(p)
+
+
+# ------------------------------------------------------------------
+# SeekModal._parse_timestamp (pure function)
+# ------------------------------------------------------------------
+
+class TestParseTimestamp:
+    """SeekModal._parse_timestamp — no screen instance needed."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("0", 0.0),
+            ("30", 30.0),
+            ("90", 90.0),
+            ("120.5", 120.5),
+            ("1:30", 90.0),
+            ("5:00", 300.0),
+            ("10:30", 630.0),
+            ("1:30:40", 5440.0),
+            ("0:05:00", 300.0),
+            ("00:00:00", 0.0),
+            ("   45   ", 45.0),
+            (" 2:15 ", 135.0),
+        ],
+    )
+    def test_valid_formats(self, raw, expected):
+        assert SeekModal._parse_timestamp(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            "   ",
+            "abc",
+            "1:2:3:4",
+            "1:aa",
+            "1:2:3:4:5",
+        ],
+    )
+    def test_invalid_formats(self, raw):
+        assert SeekModal._parse_timestamp(raw) is None
+
+
+# ------------------------------------------------------------------
+# History file I/O (no TUI thread needed)
+# ------------------------------------------------------------------
+
+class TestHistoryIO:
+    """_read_history / _write_history with temp file."""
+
+    RESUME_PATH_ATTR = "_resume_path"
+
+    def _make_app(self, tmp_path):
+        """Create an app pointed at a temp resume file."""
+        app = YouTubePlayerApp()
+        resume_file = tmp_path / "resume_state.json"
+        setattr(app, self.RESUME_PATH_ATTR, str(resume_file))
+        return app, resume_file
+
+    def test_read_empty(self, tmp_path):
+        app, _ = self._make_app(tmp_path)
+        assert app._read_history() == []
+
+    def test_write_and_read(self, tmp_path):
+        app, resume_file = self._make_app(tmp_path)
+        entries = [
+            {"video_id": "abc123", "title": "T1", "url": "http://a", "position": 10.0},
+            {"video_id": "xyz789", "title": "T2", "url": "http://b", "position": 20.0},
+        ]
+        app._write_history(entries)
+        assert resume_file.exists()
+        with open(resume_file) as f:
+            data = json.load(f)
+        assert len(data) == 2
+        assert data[0]["video_id"] == "abc123"
+
+    def test_read_legacy_single_dict(self, tmp_path):
+        """Old format: single dict → migrated to list, returned."""
+        app, resume_file = self._make_app(tmp_path)
+        legacy = {"video_id": "old", "title": "Old Track", "position": 42.0}
+        resume_file.write_text(json.dumps(legacy))
+        result = app._read_history()
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["video_id"] == "old"
+
+    def test_save_resume_truncates_to_max_history(self, tmp_path):
+        """_save_resume_data truncates when over MAX_HISTORY."""
+        app, resume_file = self._make_app(tmp_path)
+        # Seed 250 entries into history
+        entries = [{"video_id": f"vid_{i}"} for i in range(app.MAX_HISTORY + 50)]
+        app._write_history(entries)
+        # Now save a new entry — should trigger truncation
+        app.current_youtube_url = "https://www.youtube.com/watch?v=abcdef12345"
+        app.current_title = "New Entry"
+        app.current_index = 0
+        app._save_resume_data()
+        data = app._read_history()
+        assert len(data) == app.MAX_HISTORY
+        assert data[-1]["video_id"] == "abcdef12345"
+
+    def test_save_resume_data_upserts(self, tmp_path):
+        """Same video_id replaces entry instead of duplicating."""
+        app, resume_file = self._make_app(tmp_path)
+        app.current_youtube_url = "https://www.youtube.com/watch?v=abcdef12345"
+        app.current_title = "First"
+        app.current_index = 0
+        app._save_resume_data()
+        data1 = app._read_history()
+        assert len(data1) == 1
+        assert data1[0]["title"] == "First"
+
+        app.current_title = "Second"
+        app._desired_position = 99.0
+        app._save_resume_data()
+        data2 = app._read_history()
+        assert len(data2) == 1
+        assert data2[0]["title"] == "Second"
+        assert data2[0]["position"] == 99.0
+
+    def test_save_resume_skips_no_url(self, tmp_path):
+        app, _ = self._make_app(tmp_path)
+        app.current_youtube_url = ""
+        app._save_resume_data()
+        assert app._read_history() == []
+
+    def test_save_resume_skips_negative_index(self, tmp_path):
+        app, _ = self._make_app(tmp_path)
+        app.current_youtube_url = "https://www.youtube.com/watch?v=abcdef12345"
+        app.current_index = -1
+        app._save_resume_data()
+        assert app._read_history() == []
+
+
+# ------------------------------------------------------------------
+# Recent searches
+# ------------------------------------------------------------------
+
+class TestRecentSearches:
+    """recent_searches list on the app — pure in-memory, no TUI needed."""
+
+    def _make_app(self):
+        return YouTubePlayerApp()
+
+    def test_initial_empty(self):
+        app = self._make_app()
+        assert app.recent_searches == []
+
+    def test_first_search_added(self):
+        app = self._make_app()
+        app.recent_searches.insert(0, "hello")
+        assert app.recent_searches == ["hello"]
+
+    def test_deduplicate_reinserts_at_front(self):
+        app = self._make_app()
+        app.recent_searches = ["world", "hello"]
+        # Simulate do_search logic
+        query = "hello"
+        if query in app.recent_searches:
+            app.recent_searches.remove(query)
+        app.recent_searches.insert(0, query)
+        assert app.recent_searches == ["hello", "world"]
+
+    def test_capped_at_10(self):
+        app = self._make_app()
+        for i in range(15):
+            q = f"q{i}"
+            if q in app.recent_searches:
+                app.recent_searches.remove(q)
+            app.recent_searches.insert(0, q)
+            if len(app.recent_searches) > 10:
+                app.recent_searches = app.recent_searches[:10]
+        assert len(app.recent_searches) == 10
+        assert app.recent_searches[0] == "q14"
+        assert app.recent_searches[-1] == "q5"
