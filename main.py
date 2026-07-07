@@ -553,8 +553,8 @@ class YouTubePlayerApp(App):
                     self._cleanup_active_download()
                     log.info("AFTER cleanup")
 
-                    while not isinstance(self.screen, ResultsScreen):
-                        log.info("POPPING %s", type(self.screen).__name__)
+                    while isinstance(self.screen, PlayerScreen):
+                        log.info("POPPING PlayerScreen")
                         self.pop_screen()
 
                     log.info("DONE")
