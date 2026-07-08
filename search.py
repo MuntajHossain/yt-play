@@ -51,29 +51,62 @@ def _check_cache(video_id: str) -> Optional[str]:
 
 
 def _cleanup_cache() -> None:
-    """Delete cached files older than max_cache_age_hours."""
+    """Delete expired cached files and orphans not in resume history."""
     now = time.time()
-    cutoff = now - CONFIG.max_cache_age_hours * 3600
+    age_cutoff = now - CONFIG.max_cache_age_hours * 3600
+
+    active_ids: set = set()
+    resume_path = os.path.join(DOWNLOAD_DIR, "resume_state.json")
     try:
-        for fname in os.listdir(DOWNLOAD_DIR):
+        if os.path.exists(resume_path):
+            with open(resume_path) as f:
+                history = json.load(f)
+            if isinstance(history, list):
+                for entry in history:
+                    vid = entry.get("video_id")
+                    if vid:
+                        active_ids.add(vid)
+    except Exception:
+        log.exception("CACHE cleanup failed to read resume history")
+
+    try:
+        entries = os.listdir(DOWNLOAD_DIR)
+        audio_ids: set = {
+            m.group(1)
+            for fn in entries
+            if not fn.endswith(".done") and not fn.endswith(".part") and not fn.endswith(".ytdl")
+            and (m := re.match(r"^ytplay-([a-zA-Z0-9_-]{11})\..+", fn))
+        }
+
+        for fname in entries:
             fpath = os.path.join(DOWNLOAD_DIR, fname)
             if not os.path.isfile(fpath) or not fname.startswith("ytplay-"):
                 continue
+            if fname.endswith(".part") or fname.endswith(".ytdl"):
+                continue
+
+            m = re.match(r"^ytplay-([a-zA-Z0-9_-]{11})\..+", fname)
+            vid = m.group(1) if m else None
             mtime = os.path.getmtime(fpath)
-            if mtime < cutoff:
+
+            remove = False
+            if fname.endswith(".done"):
+                if vid not in audio_ids:
+                    remove = True
+                    reason = "orphan marker (no matching audio file)"
+            elif vid and vid not in active_ids:
+                remove = True
+                reason = "orphan (not in history)"
+            elif vid and vid in active_ids and mtime < age_cutoff:
+                remove = True
+                reason = f"expired (age={(now - mtime) / 3600:.1f}h)"
+            elif not vid and mtime < age_cutoff:
+                remove = True
+                reason = f"unrecognized id, expired (age={(now - mtime) / 3600:.1f}h)"
+
+            if remove:
                 os.remove(fpath)
-                log.info("CACHE cleanup removed old file: %s (age=%.1fh)", fname, (now - mtime) / 3600)
-                # Also delete the .done marker if we removed the audio file.
-                if not fname.endswith(".done"):
-                    m = re.match(r"^ytplay-([a-zA-Z0-9_-]{11})\..+", fname)
-                    if m:
-                        marker = _marker_path(m.group(1))
-                        if os.path.exists(marker):
-                            try:
-                                os.remove(marker)
-                                log.info("CACHE cleanup removed orphan marker: %s", marker)
-                            except OSError:
-                                log.exception("CACHE cleanup failed to remove marker: %s", marker)
+                log.info("CACHE cleanup removed %s: %s", reason, fname)
     except OSError:
         log.exception("CACHE cleanup error")
 
