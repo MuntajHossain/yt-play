@@ -63,6 +63,17 @@ def _cleanup_cache() -> None:
             if mtime < cutoff:
                 os.remove(fpath)
                 log.info("CACHE cleanup removed old file: %s (age=%.1fh)", fname, (now - mtime) / 3600)
+                # Also delete the .done marker if we removed the audio file.
+                if not fname.endswith(".done"):
+                    m = re.match(r"^ytplay-([a-zA-Z0-9_-]{11})\..+", fname)
+                    if m:
+                        marker = _marker_path(m.group(1))
+                        if os.path.exists(marker):
+                            try:
+                                os.remove(marker)
+                                log.info("CACHE cleanup removed orphan marker: %s", marker)
+                            except OSError:
+                                log.exception("CACHE cleanup failed to remove marker: %s", marker)
     except OSError:
         log.exception("CACHE cleanup error")
 
@@ -434,3 +445,23 @@ async def wait_for_file_growth(file_path: str, min_bytes: int = 65536, timeout: 
             pass
         await asyncio.sleep(0.2)
     return False
+
+
+async def fetch_video_title(url: str) -> str:
+    """Fetch the video title from a YouTube URL via yt-dlp --dump-json.
+
+    Returns the title string, or the URL itself if the request fails or times out.
+    """
+    cmd = _ytdlp_cmd("--dump-json", "--no-playlist", "--skip-download", url)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        info = json.loads(stdout.decode())
+        return info.get("title") or url
+    except Exception:
+        log.exception("Failed to fetch title for %s", url)
+        return url

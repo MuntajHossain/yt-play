@@ -13,6 +13,7 @@ from textual import work
 
 from search import search_youtube, start_audio_download, wait_for_file_growth, DownloadHandle, _extract_video_id
 from player import MpvPlayer
+from config import CONFIG
 
 os.makedirs("log", exist_ok=True)
 logging.basicConfig(
@@ -71,7 +72,7 @@ class MenuScreen(Screen):
     MenuScreen { align: center middle; }
     MenuScreen Vertical { width: 40; height: auto; margin: 1; }
     #menu_title { text-align: center; text-style: bold; padding-bottom: 1; }
-    #menu_list { margin-top: 1; height: 4; }
+    #menu_list { margin-top: 1; height: 5; }
     """
 
     def compose(self) -> ComposeResult:
@@ -85,6 +86,7 @@ class MenuScreen(Screen):
         menu = self.query_one("#menu_list", OptionList)
         menu.add_option(Option("▶  Play History", id="menu_history"))
         menu.add_option(Option("🔍  Search", id="menu_search"))
+        menu.add_option(Option("🔗  Play from URL", id="menu_url"))
         menu.focus()
 
     async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
@@ -93,6 +95,8 @@ class MenuScreen(Screen):
             app.go_to_history()
         elif event.option_id == "menu_search":
             app.go_to_search()
+        elif event.option_id == "menu_url":
+            app.action_play_from_url()
 
     def on_key(self, event) -> None:
         if event.key == "escape":
@@ -291,6 +295,46 @@ class SeekModal(ModalScreen[float]):
         return None
 
 
+class UrlModal(ModalScreen[str]):
+    """Input modal for a YouTube URL. Dismisses with the URL string or None."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
+
+    CSS = """
+    UrlModal { align: center middle; }
+    #url_dialog { width: 60; padding: 1 2; border: thick $primary; background: $surface; }
+    #url_label { text-align: center; padding-bottom: 1; }
+    #url_error { text-align: center; padding-top: 1; height: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="url_dialog"):
+            yield Label("Enter YouTube URL:", id="url_label")
+            yield Input(placeholder="https://www.youtube.com/watch?v=...", id="url_input")
+            yield Label("", id="url_error")
+
+    def on_mount(self) -> None:
+        self.query_one("#url_input", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        url = event.input.value.strip()
+        if not url:
+            return
+        from search import _extract_video_id
+        vid = _extract_video_id(url)
+        if not vid:
+            self.query_one("#url_error", Label).update(
+                "[red]Invalid YouTube URL — need video ID[/]"
+            )
+            return
+        self.dismiss(url)
+
+
 class PlayerScreen(Screen):
     CSS = """
     PlayerScreen { layout: vertical; }
@@ -457,6 +501,31 @@ class YouTubePlayerApp(App):
             self.push_screen(PlayerScreen())
             self._play_video_async(url, title, seek_to=position)
 
+    def action_play_from_url(self) -> None:
+        self.push_screen(UrlModal(), self._on_url_dismiss)
+
+    def _on_url_dismiss(self, url: Optional[str]) -> None:
+        if url is None:
+            return
+        self._play_url_entry(url)
+
+    @work
+    async def _play_url_entry(self, url: str) -> None:
+        """Fetch title from URL, then start playback (downloads if not cached)."""
+        from search import fetch_video_title
+        title = await fetch_video_title(url)
+
+        self.results = []
+        self.current_index = 0
+        self.current_title = title
+        self.current_youtube_url = url
+        self._recovery_attempts = 0
+        self._desired_position = 0.0
+
+        if not isinstance(self.screen, PlayerScreen):
+            self.push_screen(PlayerScreen())
+        self._play_video_async(url, title)
+
     # -- Resume / play history -------------------------------------------
 
     MAX_HISTORY = 200
@@ -472,7 +541,14 @@ class YouTubePlayerApp(App):
                     data = [data]
                     self._write_history(data)
                 if isinstance(data, list) and data:
-                    return data[-1]
+                    cutoff = time.time() - CONFIG.resume_max_age_days * 86400
+                    pruned = [e for e in data if e.get("saved_at", 0) >= cutoff]
+                    if len(pruned) < len(data):
+                        self._write_history(pruned)
+                        log.info("HISTORY pruned %d old entries (max_age=%.0fd)", len(data) - len(pruned), CONFIG.resume_max_age_days)
+                        data = pruned
+                    if data:
+                        return data[-1]
         except Exception:
             log.exception("Failed to load resume data")
         return None
