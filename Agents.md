@@ -82,15 +82,19 @@ Audio files are cached locally using the YouTube video ID as the key. Files name
 
 ## Resume Session (implemented)
 
-Playback position saved to `data/resume_state.json`:
+Playback position saved to `data/resume_state.json` as a per-video history array (keyed by `video_id`, upserted in-place by `_save_resume_data`):
 - On quit from PlayerScreen (via `action_quit()` callback)
 - Every 5s during playback (`_update_player_progress` timer)
 
-On next launch, if same video is selected from search results, position auto-restored. `_play_video_async()` checks `_resume_data` for matching `video_id`, overrides `seek_to`, and calls `self.player.play(path, seek_to=position)`.
+**Resume is per-video history lookup, not a single candidate.** `_play_video_async()` calls `_lookup_history_position(video_id)` whenever `seek_to == 0.0` (the default for search-result and URL-entry playback). If a matching history entry exists with `position > 0`, it overrides `seek_to` and the player starts from the saved position. This works for **any** previously-watched video — search results, "Play from URL", and next/prev track — regardless of where the entry sits in the history array.
+
+- **History playback** (`play_history_entry`) passes an explicit `seek_to=position`, which intentionally bypasses the resume lookup (the position is already known).
+- **Near-end guard:** `_lookup_history_position` returns `None` if `position >= duration - 5`, so a video that was essentially finished starts from 0 instead of resuming at EOF.
+- **In-memory state is stateless:** there is no `_resume_data` field consumed on first use. The history file on disk is the single source of truth, read fresh each lookup, so resume keeps working for multiple different videos in one session.
+- **App init:** `_load_and_prune_history()` migrates the legacy single-dict format to an array and prunes entries older than `CONFIG.resume_max_age_days` (30d). It does not load a resume candidate into memory.
+- **Pitfall avoided:** `_save_resume_data` upserts *in-place* (replaces the existing entry for a video_id without moving it to the end). An earlier design returned `data[-1]` as the single resume candidate at launch, so it was almost never the most-recently-played video — URL playback never resumed. The current per-video lookup is immune to array ordering.
 
 **Seek deferred to playback-restart:** Initial seek is deferred via `_pending_seek` in `MpvPlayer`. The `playback-restart` event callback applies `seek_absolute()` — avoids `MPV_ERROR_COMMAND (-12)` that fires when mpv is still loading the file.
-
-**State cleared** after successful resume apply (both `_resume_data` and the file).
 
 ## Known Quit Bug (fixed)
 
