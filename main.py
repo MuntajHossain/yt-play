@@ -435,7 +435,7 @@ class YouTubePlayerApp(App):
         self._active_download: Optional[DownloadHandle] = None
 
         self._resume_path = os.path.join("data", "resume_state.json")
-        self._resume_data: Optional[dict] = self._load_resume_data()
+        self._load_and_prune_history()
         self._last_pos_save: float = 0.0
 
         self.recent_searches: list = []  # max 10, newest first
@@ -530,27 +530,44 @@ class YouTubePlayerApp(App):
 
     MAX_HISTORY = 200
 
-    def _load_resume_data(self) -> Optional[dict]:
-        """Load play history, return last entry for resume (or None)."""
+    def _load_and_prune_history(self) -> None:
+        """Migrate legacy resume format and prune entries older than the max age."""
         try:
-            if os.path.exists(self._resume_path):
-                with open(self._resume_path) as f:
-                    data = json.load(f)
-                # Old format — single dict → migrate to array
-                if isinstance(data, dict):
-                    data = [data]
-                    self._write_history(data)
-                if isinstance(data, list) and data:
-                    cutoff = time.time() - CONFIG.resume_max_age_days * 86400
-                    pruned = [e for e in data if e.get("saved_at", 0) >= cutoff]
-                    if len(pruned) < len(data):
-                        self._write_history(pruned)
-                        log.info("HISTORY pruned %d old entries (max_age=%.0fd)", len(data) - len(pruned), CONFIG.resume_max_age_days)
-                        data = pruned
-                    if data:
-                        return data[-1]
+            if not os.path.exists(self._resume_path):
+                return
+            with open(self._resume_path) as f:
+                data = json.load(f)
+            # Old format — single dict → migrate to array
+            if isinstance(data, dict):
+                data = [data]
+                self._write_history(data)
+            if isinstance(data, list) and data:
+                cutoff = time.time() - CONFIG.resume_max_age_days * 86400
+                pruned = [e for e in data if e.get("saved_at", 0) >= cutoff]
+                if len(pruned) < len(data):
+                    self._write_history(pruned)
+                    log.info("HISTORY pruned %d old entries (max_age=%.0fd)", len(data) - len(pruned), CONFIG.resume_max_age_days)
         except Exception:
-            log.exception("Failed to load resume data")
+            log.exception("Failed to load/prune history")
+
+    def _lookup_history_position(self, video_id: str) -> Optional[float]:
+        """Return the saved playback position for *video_id*, or None.
+
+        Returns None if the video isn't in history, has no saved position,
+        or was essentially finished (position within 5s of duration) so we
+        start over instead of resuming at the very end.
+        """
+        if not video_id:
+            return None
+        for entry in self._read_history():
+            if entry.get("video_id") == video_id:
+                position = float(entry.get("position", 0.0) or 0.0)
+                duration = float(entry.get("duration", 0.0) or 0.0)
+                if position <= 0:
+                    return None
+                if duration > 0 and position >= duration - 5:
+                    return None
+                return position
         return None
 
     def _read_history(self) -> list:
@@ -602,10 +619,6 @@ class YouTubePlayerApp(App):
             history = history[-self.MAX_HISTORY:]
         self._write_history(history)
         log.info("HISTORY upserted: %s at %.1fs (%d entries)", vid, self._desired_position, len(history))
-
-    def _clear_resume_file(self) -> None:
-        """Clear in-memory resume state. History file kept for reference."""
-        pass
 
     # -- Navigation -------------------------------------------------------
 
@@ -699,16 +712,15 @@ class YouTubePlayerApp(App):
     async def _play_video_async(self, url: str, title: str, seek_to: float = 0.0) -> None:
         log.info("PLAY_VIDEO_ASYNC start: url=%s title=%s seek_to=%.1f", url, title, seek_to)
 
-        # Check saved resume position — override seek_to if this is the same video.
-        if seek_to == 0.0 and self._resume_data:
-            rid = self._resume_data.get("video_id")
-            if rid and rid == _extract_video_id(url):
-                seek_to = self._resume_data["position"]
-                pos_str = PlayerScreen._fmt(seek_to)
-                self.notify(f"Resumed at {pos_str}", timeout=3)
-                self._resume_data = None
-                self._clear_resume_file()
-                log.info("RESUME applied: %s at %.1fs", rid, seek_to)
+        # Resume from saved position if this video has a history entry.
+        if seek_to == 0.0:
+            vid = _extract_video_id(url)
+            if vid:
+                saved = self._lookup_history_position(vid)
+                if saved and saved > 0:
+                    seek_to = saved
+                    self.notify(f"Resumed at {PlayerScreen._fmt(seek_to)}", timeout=3)
+                    log.info("RESUME applied: %s at %.1fs", vid, seek_to)
 
         # Clean up any previous download before starting a new one.
         self._cleanup_active_download()

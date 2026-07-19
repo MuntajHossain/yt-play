@@ -192,6 +192,64 @@ class TestHistoryIO:
         assert app._read_history() == []
 
 
+class TestLookupHistoryPosition:
+    """_lookup_history_position drives resume for any previously-watched video."""
+
+    def _make_app(self, tmp_path):
+        app = YouTubePlayerApp()
+        setattr(app, "_resume_path", str(tmp_path / "resume_state.json"))
+        return app
+
+    def test_returns_saved_position(self, tmp_path):
+        app = self._make_app(tmp_path)
+        app._write_history([
+            {"video_id": "aaaaaaaaaaa", "position": 123.5, "duration": 1000.0},
+        ])
+        assert app._lookup_history_position("aaaaaaaaaaa") == 123.5
+
+    def test_unknown_video_returns_none(self, tmp_path):
+        app = self._make_app(tmp_path)
+        app._write_history([
+            {"video_id": "aaaaaaaaaaa", "position": 123.5, "duration": 1000.0},
+        ])
+        assert app._lookup_history_position("zzzzzzzzzzz") is None
+
+    def test_empty_video_id_returns_none(self, tmp_path):
+        app = self._make_app(tmp_path)
+        app._write_history([{"video_id": "aaaaaaaaaaa", "position": 123.5}])
+        assert app._lookup_history_position("") is None
+
+    def test_zero_position_returns_none(self, tmp_path):
+        app = self._make_app(tmp_path)
+        app._write_history([{"video_id": "aaaaaaaaaaa", "position": 0.0, "duration": 1000.0}])
+        assert app._lookup_history_position("aaaaaaaaaaa") is None
+
+    def test_finished_within_5s_returns_none(self, tmp_path):
+        """Position near the end is treated as fully watched → start over."""
+        app = self._make_app(tmp_path)
+        app._write_history([{"video_id": "aaaaaaaaaaa", "position": 997.0, "duration": 1000.0}])
+        assert app._lookup_history_position("aaaaaaaaaaa") is None
+
+    def test_just_before_threshold_still_resumes(self, tmp_path):
+        app = self._make_app(tmp_path)
+        app._write_history([{"video_id": "aaaaaaaaaaa", "position": 994.0, "duration": 1000.0}])
+        assert app._lookup_history_position("aaaaaaaaaaa") == 994.0
+
+    def test_picks_position_regardless_of_array_order(self, tmp_path):
+        """Regression: resume must not depend on the entry being last in the array.
+
+        _save_resume_data upserts in-place, so the most-recently-played video
+        is not necessarily the last array element. Lookup is by video_id.
+        """
+        app = self._make_app(tmp_path)
+        app._write_history([
+            {"video_id": "oldentry00001", "position": 5.0, "duration": 1000.0},
+            {"video_id": "target0000001", "position": 555.0, "duration": 1000.0},
+            {"video_id": "newerentry00", "position": 10.0, "duration": 1000.0},
+        ])
+        assert app._lookup_history_position("target0000001") == 555.0
+
+
 # ------------------------------------------------------------------
 # Recent searches
 # ------------------------------------------------------------------
