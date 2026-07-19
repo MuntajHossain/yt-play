@@ -159,8 +159,8 @@ class TestHistoryIO:
         assert len(data) == app.MAX_HISTORY
         assert data[-1]["video_id"] == "abcdef12345"
 
-    def test_save_resume_data_upserts(self, tmp_path):
-        """Same video_id replaces entry instead of duplicating."""
+    def test_save_resume_data_remove_and_append(self, tmp_path):
+        """Same video_id removes old entry and appends new one (moves to end)."""
         app, resume_file = self._make_app(tmp_path)
         app.current_youtube_url = "https://www.youtube.com/watch?v=abcdef12345"
         app.current_title = "First"
@@ -184,12 +184,13 @@ class TestHistoryIO:
         app._save_resume_data()
         assert app._read_history() == []
 
-    def test_save_resume_skips_negative_index(self, tmp_path):
+    def test_current_index_negative_still_saves_if_url_present(self, tmp_path):
+        """Guard is only current_youtube_url — index doesn't block saves."""
         app, _ = self._make_app(tmp_path)
         app.current_youtube_url = "https://www.youtube.com/watch?v=abcdef12345"
         app.current_index = -1
         app._save_resume_data()
-        assert app._read_history() == []
+        assert len(app._read_history()) == 1
 
 
 class TestLookupHistoryPosition:

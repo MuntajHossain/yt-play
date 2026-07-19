@@ -593,7 +593,7 @@ class YouTubePlayerApp(App):
 
     def _save_resume_data(self) -> None:
         """Upsert current position into play history — one entry per video_id."""
-        if not self.current_youtube_url or self.current_index < 0:
+        if not self.current_youtube_url:
             return
         vid = _extract_video_id(self.current_youtube_url)
         if not vid:
@@ -607,13 +607,9 @@ class YouTubePlayerApp(App):
             "saved_at": time.time(),
         }
         history = self._read_history()
-        # Replace existing entry for same video_id, or append
-        for i, e in enumerate(history):
-            if e.get("video_id") == vid:
-                history[i] = entry
-                break
-        else:
-            history.append(entry)
+        # Remove existing entry for same video_id so re-plays move to the end.
+        history = [e for e in history if e.get("video_id") != vid]
+        history.append(entry)
         # Trim oldest if over limit
         if len(history) > self.MAX_HISTORY:
             history = history[-self.MAX_HISTORY:]
@@ -806,8 +802,8 @@ class YouTubePlayerApp(App):
                 self.pop_screen()
             return
 
-        if not self.current_youtube_url or self.current_index < 0:
-            log.warning("RECOVERY aborted: no track info (url=%s, index=%d)", self.current_youtube_url, self.current_index)
+        if not self.current_youtube_url:
+            log.warning("RECOVERY aborted: no URL (index=%d)", self.current_index)
             return
 
         self._recovery_attempts += 1
