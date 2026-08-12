@@ -79,6 +79,7 @@ Position is saved to `data/resume_state.json` as a list of per-video entries (ke
 - **Stall watchdog**: a background thread polls `time-pos`; if playback hasn't advanced for `STALL_TIMEOUT_SECS` (6s) while unpaused and not buffering, and it's been at least `SEEK_SETTLE_SECS` (1s) since the last seek, it fires `on_end("Playback stalled...")` to trigger recovery. This exists because a seek past the end of the demuxer cache can silently stop advancing without mpv reporting an error.
 - Expose `process` as a bool property (`self._player is not None`) — callers guard on `if self.player.process`.
 - `_cleanup()` uses a threading lock; always goes through `stop()`, never touches `self._player` directly from outside.
+- `_cleanup()` never blocks on `player.terminate()` directly — it's run on a daemon helper thread with a bounded wait (`TERMINATE_TIMEOUT_SECS`, 5.0s) via `_terminate_with_timeout()`, because libmpv's shutdown can hang (see "Known issue" below). A timeout triggers a full thread-stack dump for diagnostics rather than freezing the app.
 
 ### Playback recovery (`main.py`)
 
@@ -96,4 +97,42 @@ Single `CONFIG` singleton (`CacheConfig` dataclass) — `cache_dir`, `max_cache_
 
 ## Logging
 
-All modules log to `log/yt-play.log` (created at import time by `main.py`) via the shared `"yt-play"` logger — not stdout, since stdout is the TUI. When debugging playback/download issues, check this file rather than adding print statements.
+All modules log via the shared `"yt-play"` logger — not stdout, since stdout is the TUI. **Session-wise log files**: each run creates its own file, `log/yt-play-{YYYYMMDD-HHMMSS}-{pid}.log` (see `SESSION_ID` in `main.py`, set up before `logging.basicConfig`), with a `SESSION START` banner line. Format includes `(%(threadName)s)` — needed because playback callbacks arrive from mpv's own thread and the stall-watchdog thread, not just the UI thread. When debugging playback/download issues, find the log file matching the run's start time rather than adding print statements.
+
+## Known issue: Ctrl+D quit can freeze on the QuitScreen (fix applied 2026-08-12, watch for recurrence)
+
+Reported: after long playback sessions (hours), pressing Ctrl+D shows the "Stop playback and return to results?" QuitScreen, but Y/N/Esc stop being recognized — app appears frozen.
+
+**Original theory (watchdog/`call_from_thread` cross-thread deadlock) was disproven by an actual repro log** (`log/yt-play-20260812-162916-8560.log`). Sequence at the freeze:
+```
+YES PRESSED
+QUIT CALLBACK RESULT=True
+BEFORE player.stop()
+CLEANUP enter
+STOP_WATCHDOG joining thread=mpv-stall-watchdog (timeout=1.0s)
+STOP_WATCHDOG thread=mpv-stall-watchdog joined cleanly   <- watchdog join was fine, took 8ms
+CLEANUP acquiring lock
+CLEANUP lock acquired
+[nothing after this — no "Error during mpv terminate", no "CLEANUP done"]
+```
+The watchdog join (the originally-suspected deadlock point) completed in 8ms — not the cause. The hang is **inside `self._player.terminate()` itself** (`player.py` `_cleanup()`, the line right after "CLEANUP lock acquired"), which never returns and never raises.
+
+**Current theory**: ~40s before the freeze, mpv's own event thread logged:
+```
+(MPVEventHandlerThread) MPV LOG [warn/file] File is apparently being appended to, will keep retrying with timeouts.
+```
+at a position ~4658s (77+ min) into a long video whose download was still trickling in. Likely libmpv's internal demuxer/network thread was mid-retry-loop reading the still-growing file when `terminate()` sent mpv's shutdown/quit command; `python-mpv`'s `terminate()` blocks waiting for the core to fully shut down and **has no timeout of its own** — if the demuxer thread doesn't respond to quit promptly (stuck in that retry-with-timeout loop), `terminate()` hangs indefinitely, which reads to the user as "Y/N not recognized" (the whole UI thread is blocked inside the dismiss callback, so no key events get processed at all).
+
+The process did not self-recover — it was gone from the process list by the time this was checked, i.e. had to be force-killed.
+
+**Still open**: why the demuxer thread doesn't unblock — is it stuck on a Windows file-read of the partially-written download file specifically, or something else in libmpv's shutdown path. No timeout exists anywhere in this call chain, so a hang here is a real freeze, not a self-resolving one like the old watchdog-join theory assumed.
+
+**Instrumentation in place** (already added, keep for next repro):
+- `player.py` `_cleanup()`: logs before/after `_stop_watchdog()`, before/after acquiring `self._lock` — this is what pinned the hang location to `terminate()`.
+- `player.py` `_stop_watchdog()`: logs the `join(timeout=1.0)` call and warns if it times out.
+- `player.py` watchdog stall path and `end-file` event callback: log immediately before/after calling `self.on_end(...)`, tagged with thread name.
+- `main.py` `_on_track_end`: logs before/after `call_from_thread(...)`, tagged with thread name.
+
+**Fix applied**: `MpvPlayer._cleanup()` now detaches `self._player` immediately (under the lock) and calls `_terminate_with_timeout()`, which runs `player.terminate()` on a daemon helper thread (`mpv-terminate-worker`) and only waits up to `TERMINATE_TIMEOUT_SECS` (5.0s). If it doesn't finish in time, the app logs `TERMINATE TIMED OUT` at `CRITICAL`, dumps every thread's Python stack via `_dump_thread_stacks()` (`faulthandler.dump_traceback(all_threads=True)`), and moves on — the hung mpv thread is abandoned (daemon, so it won't block process exit) instead of freezing the UI. This bounds the freeze to ~5s instead of forever, and the next occurrence's log will show exactly what libmpv's internal threads were doing at the moment of the hang (confirms/denies the "stuck retrying reads on a still-growing file" theory for real).
+
+**Log retention**: session log files are now pruned at startup (`main.py` `_cleanup_old_logs()`, mirrors `search.py`'s `_cleanup_cache()` pattern) — enforces both `CONFIG.log_max_age_days` (14 days) and `CONFIG.log_max_count` (20 files), whichever is stricter. Never touches the current session's own log file.

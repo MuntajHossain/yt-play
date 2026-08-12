@@ -1,6 +1,8 @@
+import glob
 import json
 import logging
 import os
+import threading
 import time
 from typing import Optional
 from textual.app import App, ComposeResult
@@ -15,17 +17,64 @@ from search import search_youtube, start_audio_download, wait_for_file_growth, D
 from player import MpvPlayer
 from config import CONFIG
 
-os.makedirs("log", exist_ok=True)
+LOG_DIR = "log"
+os.makedirs(LOG_DIR, exist_ok=True)
+# One log file per run (session), named by start time + PID, so overlapping
+# threads (UI thread vs mpv watchdog thread) can be traced within a single
+# run without interleaving across separate app launches.
+SESSION_ID = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+CURRENT_LOG_FILE = os.path.join(LOG_DIR, f"yt-play-{SESSION_ID}.log")
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] (%(threadName)s) %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join("log", "yt-play.log")),
+        logging.FileHandler(CURRENT_LOG_FILE),
     ],
 )
 log = logging.getLogger("yt-play")
+log.info("SESSION START id=%s pid=%d", SESSION_ID, os.getpid())
 
-  
+
+def _cleanup_old_logs() -> None:
+    """Delete old session log files, enforcing both limits: age
+    (CONFIG.log_max_age_days) and count (CONFIG.log_max_count), whichever
+    is stricter. Never touches the current session's own log file.
+    """
+    try:
+        files = [p for p in glob.glob(os.path.join(LOG_DIR, "yt-play-*.log")) if p != CURRENT_LOG_FILE]
+    except OSError:
+        log.exception("LOG cleanup failed to list %s", LOG_DIR)
+        return
+
+    now = time.time()
+    age_cutoff = now - CONFIG.log_max_age_days * 86400
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)  # newest first
+
+    removed = 0
+    # Keep at most log_max_count files total, counting the current session's
+    # file as one of them.
+    keep_count = max(0, CONFIG.log_max_count - 1)
+    for i, fpath in enumerate(files):
+        try:
+            mtime = os.path.getmtime(fpath)
+        except OSError:
+            continue
+        too_old = mtime < age_cutoff
+        over_count = i >= keep_count
+        if not (too_old or over_count):
+            continue
+        try:
+            os.remove(fpath)
+            removed += 1
+            log.info("LOG cleanup removed %s (%s)", fpath, "expired" if too_old else "over count limit")
+        except OSError:
+            log.exception("LOG cleanup failed to remove %s", fpath)
+    if removed:
+        log.info("LOG cleanup removed %d old session log(s)", removed)
+
+
+_cleanup_old_logs()
+
 # ---------------------------------------------------------------------------
 # Widgets
 # ---------------------------------------------------------------------------
@@ -857,10 +906,13 @@ class YouTubePlayerApp(App):
             log.exception("_on_player_error call_from_thread failed")
 
     def _on_track_end(self, error_msg: Optional[str] = None) -> None:
+        log.info("ON_TRACK_END fired on thread=%s, calling call_from_thread (blocks until UI thread services it)",
+                  threading.current_thread().name)
         try:
             self.call_from_thread(self._handle_track_end, error_msg)
         except Exception:
             log.exception("_on_track_end call_from_thread failed")
+        log.info("ON_TRACK_END call_from_thread returned on thread=%s", threading.current_thread().name)
 
     def _handle_track_end(self, error_msg: Optional[str] = None) -> None:
         log.info(

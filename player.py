@@ -1,3 +1,5 @@
+import faulthandler
+import io
 import logging
 import os
 import threading
@@ -22,6 +24,11 @@ class MpvPlayer:
     # Don't act on rapid-fire seeks individually; wait for the user to stop
     # pressing the key before checking the stream is actually progressing.
     SEEK_SETTLE_SECS = 1.0
+    # python-mpv's terminate() has no timeout of its own and can block
+    # forever if libmpv's internal demuxer/network thread doesn't respond
+    # to shutdown promptly (observed: stuck retrying reads on a still-
+    # growing download file). Bound it so quitting never freezes the app.
+    TERMINATE_TIMEOUT_SECS = 5.0
 
     def __init__(self):
         self._player: Optional[mpv.MPV] = None
@@ -156,7 +163,9 @@ class MpvPlayer:
                 error_msg = "Stream disconnected (seek past buffered range?)"
             log.info("end-file resolved as: %s", error_msg if error_msg else "normal end (no error)")
             if self.on_end:
+                log.info("END_FILE calling on_end from thread=%s", threading.current_thread().name)
                 self.on_end(error_msg)
+                log.info("END_FILE on_end returned on thread=%s", threading.current_thread().name)
 
         # Start playback
         try:
@@ -246,7 +255,16 @@ class MpvPlayer:
         self._watchdog_stop.set()
         t = self._watchdog_thread
         if t and t.is_alive() and t is not threading.current_thread():
+            log.info("STOP_WATCHDOG joining thread=%s (timeout=1.0s) from thread=%s",
+                      t.name, threading.current_thread().name)
             t.join(timeout=1.0)
+            if t.is_alive():
+                log.warning(
+                    "STOP_WATCHDOG join TIMED OUT — thread=%s still alive "
+                    "(likely blocked inside on_end/call_from_thread waiting for UI thread)", t.name
+                )
+            else:
+                log.info("STOP_WATCHDOG thread=%s joined cleanly", t.name)
         self._watchdog_thread = None
 
     def _watchdog_loop(self):
@@ -285,7 +303,9 @@ class MpvPlayer:
             self.is_playing = False
             stuck_pos = self.current_time
             if self.on_end:
+                log.warning("WATCHDOG calling on_end (stall) from thread=%s", threading.current_thread().name)
                 self.on_end(f"Playback stalled at {stuck_pos:.1f}s (cache exhausted after seek)")
+                log.warning("WATCHDOG on_end (stall) returned on thread=%s", threading.current_thread().name)
 
 
     @property
@@ -332,14 +352,62 @@ class MpvPlayer:
     # ------------------------------------------------------------------
 
     def _cleanup(self):
+        log.info("CLEANUP enter from thread=%s", threading.current_thread().name)
         self._stop_watchdog()
+        log.info("CLEANUP acquiring lock from thread=%s", threading.current_thread().name)
+        player_to_terminate = None
         with self._lock:
-            if self._player:
-                try:
-                    self._player.terminate()
-                except Exception:
-                    log.exception("Error during mpv terminate")
-                self._player = None
+            log.info("CLEANUP lock acquired from thread=%s", threading.current_thread().name)
+            player_to_terminate = self._player
+            self._player = None
+        if player_to_terminate is not None:
+            self._terminate_with_timeout(player_to_terminate)
+        log.info("CLEANUP done from thread=%s", threading.current_thread().name)
+
+    def _terminate_with_timeout(self, player: "mpv.MPV") -> None:
+        """Run player.terminate() on a helper thread and bound how long we
+        wait for it. See TERMINATE_TIMEOUT_SECS — libmpv's shutdown can hang
+        (observed cause of the Ctrl+D quit freeze), so never block forever.
+        """
+        done = threading.Event()
+
+        def _run():
+            log.info("TERMINATE_WORKER calling player.terminate() from thread=%s",
+                      threading.current_thread().name)
+            try:
+                player.terminate()
+                log.info("TERMINATE_WORKER player.terminate() returned normally")
+            except Exception:
+                log.exception("TERMINATE_WORKER player.terminate() raised")
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_run, name="mpv-terminate-worker", daemon=True)
+        t.start()
+        log.info("CLEANUP waiting up to %.1fs for %s", self.TERMINATE_TIMEOUT_SECS, t.name)
+        if done.wait(timeout=self.TERMINATE_TIMEOUT_SECS):
+            log.info("CLEANUP %s finished within timeout", t.name)
+            return
+        log.critical(
+            "TERMINATE TIMED OUT after %.1fs — player.terminate() is still blocked on thread=%s. "
+            "Abandoning it (daemon thread) so the app doesn't freeze; the underlying mpv "
+            "process/thread may linger until it unblocks or the interpreter exits.",
+            self.TERMINATE_TIMEOUT_SECS, t.name,
+        )
+        self._dump_thread_stacks(reason="mpv terminate() timeout")
+
+    def _dump_thread_stacks(self, reason: str) -> None:
+        """Best-effort dump of every live thread's Python stack, for
+        diagnosing hangs (e.g. what libmpv's demuxer/network thread is
+        actually stuck on when terminate() times out).
+        """
+        buf = io.StringIO()
+        try:
+            faulthandler.dump_traceback(file=buf, all_threads=True)
+        except Exception:
+            log.exception("Failed to dump thread stacks (%s)", reason)
+            return
+        log.critical("THREAD STACK DUMP (%s):\n%s", reason, buf.getvalue())
 
     def _notify_error(self, msg: str):
         if self.on_error:
