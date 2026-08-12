@@ -15,3 +15,6 @@ wheels/
 # Runtime data & logs
 data/
 log/
+
+# Vendored libmpv binaries (too large for git; see AGENTS.md/CLAUDE.md for how to obtain)
+mpv-lib/

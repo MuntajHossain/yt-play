@@ -94,6 +94,7 @@ Single `CONFIG` singleton (`CacheConfig` dataclass) — `cache_dir`, `max_cache_
 - `git add <file>` can silently no-op if the on-disk filename's case doesn't match what's in `git status` (e.g. `Agents.md` vs `AGENTS.md`) — match case exactly.
 - Path separators / PATH env manipulation should use `os.pathsep`/`os.path.join`, not hardcoded `:`/`/`.
 - Python 3.14+ raises when touching a closed pipe's fileno — see `DownloadHandle.kill()` above.
+- `mpv-lib/` (vendored `mpv-2.dll`/`libmpv-2.dll` + MinGW import libs, ~225MB) is **gitignored, not tracked** — it exceeded GitHub's 100MB file limit and was purged from git history on 2026-08-12. It must exist on disk locally (untouched by git) for playback to work; if missing, re-obtain the libmpv Windows build and place it at `mpv-lib/` per the layout `player.py` expects.
 
 ## Logging
 
