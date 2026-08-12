@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("yt-play")
 
-
+  
 # ---------------------------------------------------------------------------
 # Widgets
 # ---------------------------------------------------------------------------
@@ -739,8 +739,23 @@ class YouTubePlayerApp(App):
                 self.pop_screen()
             return
 
-        log.info("PLAY_VIDEO_ASYNC waiting for initial buffer at %s", handle.file_path)
-        got_data = await wait_for_file_growth(handle.file_path, min_bytes=65536, timeout=15.0)
+        # Seeking ahead of what's downloaded only works once the file actually
+        # has bytes covering that timestamp — a flat 64KB floor is fine for a
+        # fresh start (seek_to=0) but far too small when resuming/recovering
+        # deep into a track, since mpv then seeks past the current EOF of the
+        # still-growing file and reports a (false) normal end-of-file instead
+        # of waiting, which used to get misread as the track finishing.
+        min_bytes = 65536
+        buffer_timeout = 15.0
+        if seek_to > 0:
+            min_bytes = max(min_bytes, int(seek_to * 20000))  # ~160kbps conservative estimate
+            buffer_timeout = max(buffer_timeout, seek_to * 0.05)  # assume >=20x realtime download speed
+
+        log.info(
+            "PLAY_VIDEO_ASYNC waiting for initial buffer (min_bytes=%d timeout=%.1f) at %s",
+            min_bytes, buffer_timeout, handle.file_path,
+        )
+        got_data = await wait_for_file_growth(handle.file_path, min_bytes=min_bytes, timeout=buffer_timeout)
 
         if handle.error:
             log.error("PLAY_VIDEO_ASYNC download failed before playable: %s", handle.error)
@@ -852,6 +867,20 @@ class YouTubePlayerApp(App):
             "TRACK_END handled: error_msg=%s pos=%.1f desired_pos=%.1f recovery_attempts=%d",
             error_msg, self.player.current_time, self._desired_position, self._recovery_attempts,
         )
+        # A "normal" end-file while the backing download hasn't finished yet
+        # means mpv hit the current end of a still-growing file, not the real
+        # end of the track (e.g. a resume/recovery seek landed ahead of what's
+        # downloaded so far). Treat that as recoverable instead of advancing.
+        download = self._active_download
+        if not error_msg and download is not None and not download.is_done:
+            error_msg = (
+                f"Playback ended prematurely at {self.player.current_time:.1f}s "
+                "(download still in progress)"
+            )
+            log.warning(
+                "TRACK_END normal-end while download unfinished -> treating as recoverable (pos=%.1f)",
+                self.player.current_time,
+            )
         if error_msg:
             log.error("TRACK_END with error -> starting recovery: %s", error_msg)
             log.info("HANDLE_TRACK_END -> recovery")
