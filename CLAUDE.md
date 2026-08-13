@@ -94,7 +94,10 @@ Single `CONFIG` singleton (`CacheConfig` dataclass) — `cache_dir`, `max_cache_
 - `git add <file>` can silently no-op if the on-disk filename's case doesn't match what's in `git status` (e.g. `Agents.md` vs `AGENTS.md`) — match case exactly.
 - Path separators / PATH env manipulation should use `os.pathsep`/`os.path.join`, not hardcoded `:`/`/`.
 - Python 3.14+ raises when touching a closed pipe's fileno — see `DownloadHandle.kill()` above.
-- `mpv-lib/` (vendored `mpv-2.dll`/`libmpv-2.dll` + MinGW import libs, ~225MB) is **gitignored, not tracked** — it exceeded GitHub's 100MB file limit and was purged from git history on 2026-08-12. It must exist on disk locally (untouched by git) for playback to work; if missing, re-obtain the libmpv Windows build and place it at `mpv-lib/` per the layout `player.py` expects.
+- `mpv-lib/` (vendored `libmpv-2.dll` + MinGW import libs/headers, ~112MB) is **gitignored, not tracked** — it exceeded GitHub's 100MB file limit and was purged from git history on 2026-08-12. It must exist on disk locally for playback to work, but is fetched automatically rather than committed:
+  - `setup_mpv.py` (`fetch_mpv_lib()`) downloads the latest plain (non-`-v3`/AVX2) x86_64 build from the community Windows builds linked off mpv.io (hosted on SourceForge, discovered via that project's RSS feed so the exact filename/version isn't hardcoded), extracts it with Windows' built-in `tar.exe` (bsdtar — `py7zr` can't handle these archives' BCJ2 compression filter), and places it at `mpv-lib/`.
+  - Download is chunked across `DOWNLOAD_THREADS` (6) threads via HTTP Range requests when the file is large enough (`MIN_CHUNKED_SIZE`) — SourceForge round-robins each request to a different mirror but all mirrors serve identical bytes and honor Range, so this is safe; falls back to a single-threaded download if a chunk request fails for any reason.
+  - `main.py` calls `fetch_mpv_lib()` at startup (no-ops if `mpv-lib/libmpv-2.dll` already exists) — a fresh clone just needs `uv run main.py`. Run `uv run setup_mpv.py --force` to re-fetch manually.
 
 ## Logging
 

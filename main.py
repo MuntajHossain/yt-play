@@ -14,7 +14,6 @@ from textual.binding import Binding
 from textual import work
 
 from search import search_youtube, start_audio_download, wait_for_file_growth, DownloadHandle, _extract_video_id
-from player import MpvPlayer
 from config import CONFIG
 
 LOG_DIR = "log"
@@ -74,6 +73,19 @@ def _cleanup_old_logs() -> None:
 
 
 _cleanup_old_logs()
+
+# mpv-lib/ (libmpv DLL) is gitignored — too large for GitHub — so pull it on
+# first run if it's missing. See setup_mpv.py / CLAUDE.md "Windows-specific
+# notes". Must happen before `import player`, which imports `mpv` and needs
+# the DLL on PATH immediately.
+from setup_mpv import fetch_mpv_lib
+try:
+    fetch_mpv_lib()
+except Exception:
+    log.exception("Failed to auto-fetch mpv-lib/ — run `uv run setup_mpv.py` manually")
+    raise
+
+from player import MpvPlayer
 
 # ---------------------------------------------------------------------------
 # Widgets
