@@ -18,3 +18,8 @@ log/
 
 # Vendored libmpv binaries (too large for git; see AGENTS.md/CLAUDE.md for how to obtain)
 mpv-lib/
+
+# Vendored Deno + bgutil-ytdlp-pot-provider (auto-fetched on the PO-token
+# fix branch; harmless leftovers here too since branches share a worktree)
+deno-bin/
+pot-provider/
