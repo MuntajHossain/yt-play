@@ -296,6 +296,11 @@ async def extract_audio_url(video_url: str) -> tuple[Optional[str], Optional[str
 class DownloadHandle:
     """Tracks a background yt-dlp download-to-file in progress."""
 
+    # yt-dlp announces the file it just opened via one of these lines on
+    # stdout, at the moment it opens it - before any audio bytes arrive.
+    _DEST_RE = re.compile(r"^\[download\] Destination:\s*(.+)$")
+    _EXISTS_RE = re.compile(r"^\[download\] (.+) has already been downloaded$")
+
     def __init__(self, process: Optional["asyncio.subprocess.Process"], dest_template: str, file_id: str, video_id: str, is_cached: bool = False):
         self.process = process
         self.dest_template = dest_template
@@ -306,6 +311,15 @@ class DownloadHandle:
         self._done = is_cached
         self._error: Optional[str] = None
         self._is_cached = is_cached
+        self._path_ready = asyncio.Event()
+        self._stderr_chunks: List[bytes] = []
+        self._stdout_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
+        if is_cached:
+            self._path_ready.set()
+        elif process is not None:
+            self._stdout_task = asyncio.create_task(self._read_stdout())
+            self._stderr_task = asyncio.create_task(self._read_stderr())
 
     @property
     def is_cached(self) -> bool:
@@ -323,15 +337,55 @@ class DownloadHandle:
     def error(self) -> Optional[str]:
         return self._error
 
+    async def _read_stdout(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        try:
+            async for raw in self.process.stdout:
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                match = self._DEST_RE.match(line) or self._EXISTS_RE.match(line)
+                if match and not self._path_ready.is_set():
+                    self.file_path = match.group(1).strip()
+                    log.info("DOWNLOAD file path resolved (event): %s", self.file_path)
+                    self._path_ready.set()
+        except Exception:
+            log.exception("DOWNLOAD stdout reader failed (video_id=%s)", self.video_id)
+        finally:
+            # Unblock any waiter even if the destination line never showed up
+            # (e.g. yt-dlp errored out before reaching the download step).
+            self._path_ready.set()
+
+    async def _read_stderr(self) -> None:
+        assert self.process is not None and self.process.stderr is not None
+        try:
+            async for raw in self.process.stderr:
+                self._stderr_chunks.append(raw)
+        except Exception:
+            log.exception("DOWNLOAD stderr reader failed (video_id=%s)", self.video_id)
+
+    async def wait_for_path(self, timeout: float = 30.0) -> Optional[str]:
+        """Wait for yt-dlp to announce its destination file - event-driven, no disk polling."""
+        if self._is_cached:
+            return self.file_path
+        try:
+            await asyncio.wait_for(self._path_ready.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            log.warning("DOWNLOAD path event timed out after %.1fs (video_id=%s)", timeout, self.video_id)
+        return self.file_path
+
     async def wait(self) -> Optional[str]:
         """Wait for the download to finish. Returns an error string, or None on success."""
         if self._is_cached:
             return None
-        _stdout, stderr = await self.process.communicate()
+        returncode = await self.process.wait()
+        if self._stdout_task is not None:
+            await self._stdout_task
+        if self._stderr_task is not None:
+            await self._stderr_task
         self._done = True
-        if self.process.returncode != 0:
+        if returncode != 0:
+            stderr = b"".join(self._stderr_chunks)
             err_text = stderr.decode("utf-8", errors="replace")[-400:] if stderr else ""
-            self._error = err_text.strip() or f"yt-dlp exited with code {self.process.returncode}"
+            self._error = err_text.strip() or f"yt-dlp exited with code {returncode}"
             log.error("DOWNLOAD failed: %s", self._error)
         else:
             log.info("DOWNLOAD finished OK: %s", self.file_path)
@@ -348,6 +402,9 @@ class DownloadHandle:
 
     def kill(self):
         p = self.process
+        for task in (self._stdout_task, self._stderr_task):
+            if task is not None:
+                task.cancel()
         if p is not None and p.returncode is None:
             try:
                 p.kill()
@@ -436,30 +493,13 @@ async def start_audio_download(video_url: str) -> Tuple[Optional[DownloadHandle]
         return None, f"Failed to start download: {e}"
 
     handle = DownloadHandle(process, dest_template, video_id, video_id)
-    # Discover the real on-disk path (with actual extension) as soon as it appears.
-    found_path = await _wait_for_download_path(video_id, timeout=10.0)
-    if found_path:
-        handle.file_path = found_path
-        log.info("DOWNLOAD file path resolved: %s", found_path)
-    else:
-        log.warning("DOWNLOAD file not yet visible on disk after launch (video_id=%s)", video_id)
+    # Discover the real on-disk path (with actual extension) as soon as
+    # yt-dlp announces it on stdout - event-driven, no disk polling.
+    found_path = await handle.wait_for_path(timeout=30.0)
+    if not found_path:
+        log.warning("DOWNLOAD path event not seen within timeout (video_id=%s)", video_id)
 
     return handle, None
-
-
-async def _wait_for_download_path(video_id: str, timeout: float = 10.0) -> Optional[str]:
-    """Poll the download dir for the file yt-dlp actually created for *video_id*."""
-    deadline = time.monotonic() + timeout
-    pattern = os.path.join(DOWNLOAD_DIR, f"ytplay-{video_id}.*")
-    while time.monotonic() < deadline:
-        matches = [
-            p for p in glob.glob(pattern)
-            if not p.endswith(".part") and not p.endswith(".ytdl") and not p.endswith(".done")
-        ]
-        if matches:
-            return matches[0]
-        await asyncio.sleep(0.1)
-    return None
 
 
 async def wait_for_file_growth(file_path: str, min_bytes: int = 65536, timeout: float = 15.0) -> bool:
