@@ -1,202 +1,144 @@
-# Agents Configuration
+# AGENTS.md
 
-This file outlines the configuration and details of the YouTube Player project for future AI development agents.
+This file provides guidance to AI coding agents (Claude Code, Codex, etc.) when working with code in this repository.
 
 ## Project Overview
-A terminal-based YouTube audio player using `yt-dlp` to search and fetch audio streams, and `libmpv` (via `python-mpv`) for playback. The interface is built with the Textual TUI framework, using a **3-screen architecture** instead of a single cluttered view.
 
-## Tech Stack
-* **Language:** Python (3.10+)
-* **Package Manager:** uv
-* **Key Dependencies:**
-  * `yt-dlp` - For searching YouTube and retrieving stream URLs.
-  * `textual` - For the terminal user interface (screens, widgets, bindings).
-  * `python-mpv` - libmpv bindings for audio playback.
-  * `mpv` - External binary; must be on PATH.
+Terminal-based YouTube audio player. `yt-dlp` for search/stream extraction, `libmpv` (via `python-mpv`) for playback, `textual` for the TUI. Single-package layout — no `src/` dir, four top-level modules: `main.py`, `search.py`, `player.py`, `config.py`.
 
-## Project Structure
-* [main.py](file:///c:/Users/hossa/Personal/Python/yt-play/main.py) - App orchestrator + 4 screen/modal classes (Search, Results, Player, SeekModal).
-* [search.py](file:///c:/Users/hossa/Personal\Python\yt-play\search.py) - Async wrappers for running `yt-dlp` queries via `asyncio.create_subprocess_exec`.
-* [player.py](file:///c:/Users/hossa\Personal\Python\yt-play\player.py) - MpvPlayer class wrapping `python-mpv` (libmpv) for audio playback.
-* [config.py](file:///c:/Users/hossa/Personal\Python\yt-play\config.py) — Cache configuration (max age, dir).
-* [.vscode/settings.json](file:///c:/Users/hossa/Personal/Python/yt-play/.vscode/settings.json) — Workspace settings (disables auto venv activation).
-* [mpv-lib/](file:///c:/Users/hossa/Personal\Python\yt-play\mpv-lib/) — Contains `mpv-2.dll` (libmpv for python-mpv) and MinGW import libs.
-* ~~[ui_components.py](file:///c:/Users/hossa/Personal\Python\yt-play\ui_components.py)~~ — **Deleted.** Widget logic moved into screen classes in `main.py`.
+## Commands
 
-## Architecture: 3-Screen Navigation
-
-The app uses Textual's `push_screen`/`pop_screen` stack:
-
-```
-[SearchScreen] → search → [ResultsScreen] → select → [PlayerScreen]
-       ↑                      ↑  [Esc]                     [Esc]  │
-       └──────────────────────┘                                track ends
-                                                                or user pops
-```
-
-- **SearchScreen** — Centered input, no clutter. `Input.Submitted` triggers `app.do_search()`.
-- **ResultsScreen** — Displays `OptionList` of search results. `Esc` pops back to search. Selection calls `app.play_at()`.
-- **PlayerScreen** — Shows now-playing title, progress bar with time labels, controls help. Live updates from player callbacks.
-- **QuitScreen** — Modal confirmation (`Ctrl+D`). Extends `ModalScreen[bool]`.
-- **SeekModal** — Input modal to seek to exact timestamp (`g` key). Accepts H:MM:SS, M:SS, or seconds. Validates against track duration.
-- **`@work` decorators** on async methods that dispatch background work (`do_search`, `_play_video_async`). These return `Worker` objects — do **not** `await` them. `do_search` uses `exclusive=True` (concurrent searches wasteful). `_play_video_async` intentionally avoids `exclusive=True` so N/P next/prev track works — old download cleaned up via `_cleanup_active_download()` inside the method.
-
-## Setup & Installation
 ```bash
-uv sync
+uv sync                        # install deps
+uv sync --dev                  # install + dev deps (pytest)
+uv run main.py                 # run the app
+uv run pytest -v                        # all tests
+uv run pytest test/test_search.py -v    # one test file
+uv run pytest -k "extract_video_id"     # by keyword
 ```
 
-## Running the Application
-```bash
-uv run main.py
+No lint/format config present (no ruff/black/mypy configured) — don't invent one, don't run tools that aren't set up.
+
+## Architecture
+
+### Screen stack (Textual `push_screen`/`pop_screen`)
+
+```
+[MenuScreen] --history--> [HistoryScreen] --select--------> [PlayerScreen]
+     │                                                            ↑
+     ├--search---------> [SearchScreen] --search--> [ResultsScreen] --select--┘
+     │
+     └--URL-------------> [UrlModal] ------------------------------> [PlayerScreen]
 ```
 
-## Key Bindings
+All screen/modal classes live in `main.py` (no separate widgets module):
+- **MenuScreen** — entry point, three options: Play History / Search / Play from URL.
+- **HistoryScreen** — lists play history newest-first (list is reversed for display; index math un-reverses on selection). Selecting plays the entry, downloading if not cached.
+- **SearchScreen** — `Input.Submitted` → `app.do_search()`. `$0` repeats the last search and auto-plays the first result.
+- **ResultsScreen** — `OptionList` of results; selection calls `app.play_at(index)`.
+- **PlayerScreen** — now-playing title, progress bar, live updates from player callbacks.
+- **QuitScreen** — `ModalScreen[bool]`, Y/N/Esc confirmation on `Ctrl+D`.
+- **SeekModal** — `g` key, parses H:MM:SS / M:SS / seconds, validates against duration, dismisses with float or `None`.
+- **UrlModal** — "Play from URL" input, validates via `_extract_video_id` before dismissing.
 
-| Key | Action |
-|---|---|
-| `Ctrl+D` | Quit (with confirmation) — avoids VS Code `Ctrl+Q` conflict |
-| `Space` | Play / Pause |
-| `Left / Right` | Seek ±5s |
-| `G` | Go to position (H:MM:SS, M:SS, or seconds) |
-| `Up / Down` | Volume ±5 |
-| `N / P` | Next / Previous track |
-| `[ / ]` | Speed ∓0.25x (range 0.25–3.0) |
-| `Esc` | Back to previous screen |
+All app state and logic lives on `YouTubePlayerApp`; screens stay thin (UI + calling `self.app` methods). Bindings are app-level (not per-screen) so playback controls (space/seek/volume/n/p/speed) work from any screen.
 
-Bindings are app-level, so playback controls work from any screen.
+`@work` decorators mark async methods that dispatch background jobs and return `Worker` objects — never `await` them:
+- `do_search` uses `exclusive=True` (concurrent searches are wasteful).
+- `_play_video_async` intentionally does **not** use `exclusive=True`, so N/P (next/prev) works — the previous download is cancelled explicitly via `_cleanup_active_download()` inside the method, not by worker exclusivity.
+- Callbacks fired from the player's own thread (`on_time_update`, `on_error`, `on_end`) must cross back via `self.call_from_thread(...)` before touching any widget.
 
-## Audio Download Cache
+### Download-to-disk-and-play (`search.py`)
 
-Audio files are cached locally using the YouTube video ID as the key. Files named `ytplay-{video_id}.{ext}` in `data/`. A `.done` marker file tracks completion.
+Streaming directly from YouTube's CDN URL works for in-order playback but seeking ahead of mpv's network buffer can stall indefinitely. Instead, yt-dlp downloads audio to a local file in the background and mpv plays the file while it's still growing — local seeks are instant once bytes are on disk; seeking ahead of what's downloaded just waits for the download to catch up.
 
-**Cache flow:**
-1. Before each download, prune files >7h old (`config.py` — `CacheConfig.max_cache_age_hours`)
-2. Extract `video_id` from URL, check if `ytplay-{video_id}.done` + audio file exist
-3. Cache hit → return handle with `is_cached=True`, no yt-dlp subprocess
-4. Partial file (no `.done` marker) → delete and re-download 
-5. After download completes → write `.done` marker via `DownloadHandle.wait()`
-6. `main.py`'s `_cleanup_active_download()` skips cached files (doesn't delete them)
+- `AUDIO_FORMAT_SELECTOR` prefers a **progressive** (non-DASH-fragmented) HTTPS stream — DASH segments handle arbitrary seeks less reliably.
+- No `--extract-audio`/`--audio-format` — that triggers an ffmpeg post-process that only writes output after the *entire* download finishes, defeating play-while-downloading.
+- Files named `ytplay-{video_id}.{ext}` in `data/`; a `.done` marker file marks a completed download.
+- `start_audio_download()`: cache hit (marker + file both exist) → return handle with `is_cached=True`, no subprocess. Partial download (file present, no marker) → deleted and re-downloaded.
+- `_cleanup_cache()` runs before every new download: removes orphan `.done` markers, files not referenced by any resume-history `video_id`, and history-referenced files older than `CacheConfig.max_cache_age_hours` (7 days).
+- `DownloadHandle.kill()` closes stdout/stderr and calls `p.wait()` after killing — needed to avoid `ValueError: I/O operation on closed pipe` on Windows (Python 3.14+ raises if a pipe fileno is touched after close).
+- `extract_audio_url` / `fetch_video_title` return errors as tuples/fallback strings rather than raising — callers must handle the failure value, not assume success.
+- The output path is resolved **event-driven, not by polling**: yt-dlp's stdout is watched for the `[download] Destination: ...` line as soon as it's printed, instead of stat'ing the download directory every 100ms for a matching filename. `DownloadHandle.wait()` streams stderr incrementally rather than buffering it all via `process.communicate()`.
 
-**Config:** `config.py` — `CacheConfig` dataclass with `cache_dir` and `max_cache_age_hours`.
+### Resume / play history
 
-## Resume Session (implemented)
+Position is saved to `data/resume_state.json` as a list of per-video entries (keyed by `video_id`, upserted in place), on quit from `PlayerScreen` and every 5s during playback.
 
-Playback position saved to `data/resume_state.json` as a per-video history array (keyed by `video_id`, upserted in-place by `_save_resume_data`):
-- On quit from PlayerScreen (via `action_quit()` callback)
-- Every 5s during playback (`_update_player_progress` timer)
+- **Resume is a per-video history lookup, not "the last played candidate."** `_play_video_async()` calls `_lookup_history_position(video_id)` whenever `seek_to == 0.0` (the default for search-result and URL playback). This works for *any* previously-watched video regardless of its position in the history array — critical because `_save_resume_data` upserts in place (doesn't move the entry to the end), so `data[-1]` is *not* reliably "most recent."
+- `_lookup_history_position` returns `None` if `position >= duration - 5` (near-finished videos start over instead of resuming at EOF).
+- `play_history_entry` passes an explicit `seek_to=position`, bypassing the lookup (position is already known).
+- History is stateless on disk — read fresh on every lookup, no in-memory resume candidate cached at startup.
+- `_load_and_prune_history()` (app init) migrates the legacy single-dict format to a list and prunes entries older than `CONFIG.resume_max_age_days` (30 days).
 
-**Resume is per-video history lookup, not a single candidate.** `_play_video_async()` calls `_lookup_history_position(video_id)` whenever `seek_to == 0.0` (the default for search-result and URL-entry playback). If a matching history entry exists with `position > 0`, it overrides `seek_to` and the player starts from the saved position. This works for **any** previously-watched video — search results, "Play from URL", and next/prev track — regardless of where the entry sits in the history array.
+### Player (`player.py`)
 
-- **History playback** (`play_history_entry`) passes an explicit `seek_to=position`, which intentionally bypasses the resume lookup (the position is already known).
-- **Near-end guard:** `_lookup_history_position` returns `None` if `position >= duration - 5`, so a video that was essentially finished starts from 0 instead of resuming at EOF.
-- **In-memory state is stateless:** there is no `_resume_data` field consumed on first use. The history file on disk is the single source of truth, read fresh each lookup, so resume keeps working for multiple different videos in one session.
-- **App init:** `_load_and_prune_history()` migrates the legacy single-dict format to an array and prunes entries older than `CONFIG.resume_max_age_days` (30d). It does not load a resume candidate into memory.
-- **Pitfall avoided:** `_save_resume_data` upserts *in-place* (replaces the existing entry for a video_id without moving it to the end). An earlier design returned `data[-1]` as the single resume candidate at launch, so it was almost never the most-recently-played video — URL playback never resumed. The current per-video lookup is immune to array ordering.
+`MpvPlayer` wraps `python-mpv` (libmpv bindings, not a subprocess/named-pipe player). Key points for anyone touching it:
 
-**Seek deferred to playback-restart:** Initial seek is deferred via `_pending_seek` in `MpvPlayer`. The `playback-restart` event callback applies `seek_absolute()` — avoids `MPV_ERROR_COMMAND (-12)` that fires when mpv is still loading the file.
+- `os.environ["PATH"]` is prepended with `mpv-lib/` at import time so libmpv's DLL (`mpv-2.dll`) is discoverable on Windows — don't remove this before importing `mpv`.
+- **Initial seek is deferred**: `play(path, seek_to=N)` stores `N` in `_pending_seek`; the actual `seek_absolute()` call happens inside the `playback-restart` event callback. Calling `seek_absolute()` immediately after `play()` raises `MPV_ERROR_COMMAND (-12)` because mpv is still loading.
+- **Stall watchdog**: a background thread polls `time-pos`; if playback hasn't advanced for `STALL_TIMEOUT_SECS` (6s) while unpaused and not buffering, and it's been at least `SEEK_SETTLE_SECS` (1s) since the last seek, it fires `on_end("Playback stalled...")` to trigger recovery. This exists because a seek past the end of the demuxer cache can silently stop advancing without mpv reporting an error.
+- Expose `process` as a bool property (`self._player is not None`) — callers guard on `if self.player.process`.
+- `_cleanup()` uses a threading lock; always goes through `stop()`, never touches `self._player` directly from outside.
+- `_cleanup()` never blocks on `player.terminate()` directly — it's run on a daemon helper thread with a bounded wait (`TERMINATE_TIMEOUT_SECS`, 5.0s) via `_terminate_with_timeout()`, because libmpv's shutdown can hang (see "Known issue" below). A timeout triggers a full thread-stack dump for diagnostics rather than freezing the app.
 
-## Known Quit Bug (fixed)
+### Playback recovery (`main.py`)
 
-Pressing `y` on quit modal from PlayerScreen previously triggered `end-file` → `_advance_to_next()` which pushed a new PlayerScreen before the old one was popped. Fix: disconnect `self.player.on_end = None` before `self.player.stop()` in the quit callback.
+`_handle_track_end` distinguishes a genuine end-of-track from a false EOF: if mpv reports a normal end (`error_msg is None`) but the backing `DownloadHandle` isn't done yet, that's treated as recoverable (the file just hasn't grown far enough) rather than "queue advance." Real errors and this false-EOF case both go through `_attempt_recovery()`, which re-extracts/restarts the download and resumes at `max(player.current_time, self._desired_position)`, capped at `MAX_RECOVERY_ATTEMPTS` (3).
 
-## Common Mistakes & Troubleshooting
+### Config (`config.py`)
 
-### 1. mpv / python-mpv Issues
-**Problem:** `ModuleNotFoundError: No module named 'mpv'`
-**Solution:** Run `uv sync` to install `python-mpv`. Ensure mpv binary is on PATH.
+Single `CONFIG` singleton (`CacheConfig` dataclass) — `cache_dir`, `max_cache_age_hours`, `resume_max_age_days`. Import as `from config import CONFIG`; don't hardcode cache paths elsewhere.
 
-### 2. yt-dlp Fails to Fetch Streams
-**Problem:** No video results or empty search
-**Solution:** Check internet connection and yt-dlp version: `yt-dlp --version`. Update: `uv pip install --upgrade yt-dlp`
+## Windows-specific notes
 
-### 3. extract_audio_url Fails
-**Problem:** "Failed to load audio" with specific error message
-**Solution:** The function now returns `(url, error_reason)` tuples. Distinguishes: private video, age-restricted, copyright/removed, network errors.
+- `git add <file>` can silently no-op if the on-disk filename's case doesn't match what's in `git status` (e.g. `Agents.md` vs `AGENTS.md`) — match case exactly.
+- Path separators / PATH env manipulation should use `os.pathsep`/`os.path.join`, not hardcoded `:`/`/`.
+- Python 3.14+ raises when touching a closed pipe's fileno — see `DownloadHandle.kill()` above.
+- `mpv-lib/` (vendored `libmpv-2.dll` + MinGW import libs/headers, ~112MB) is **gitignored, not tracked** — it exceeded GitHub's 100MB file limit and was purged from git history on 2026-08-12. It must exist on disk locally for playback to work, but is fetched automatically rather than committed:
+  - `setup_mpv.py` (`fetch_mpv_lib()`) downloads the latest plain (non-`-v3`/AVX2) x86_64 build from the community Windows builds linked off mpv.io (hosted on SourceForge, discovered via that project's RSS feed so the exact filename/version isn't hardcoded), and places it at `mpv-lib/`.
+  - Extraction is pure Python, no external program shelled out to. `py7zr` parses the 7z container and decompresses the LZMA/LZMA2 substreams, but can't decode the BCJ2 filter these archives apply to the main DLL (a known py7zr gap — see its `UnsupportedCompressionMethodError` for method id `0303011b`). `setup_mpv.py`'s `_bcj2_decode()` implements that one filter from the public-domain 7-Zip SDK algorithm (a 258-context binary range coder deciding, per `CALL`/`JMP`/`Jcc` opcode, whether to splice a reconstructed relative address back into the main stream) — `_resolve_input`/`_resolve_output` walk the folder's coder/bindpair graph generically to feed it the right 4 substreams. Verified bit-for-bit against a reference extraction before relying on it.
+  - Download is chunked across `DOWNLOAD_THREADS` (6) threads via HTTP Range requests when the file is large enough (`MIN_CHUNKED_SIZE`) — SourceForge round-robins each request to a different mirror but all mirrors serve identical bytes and honor Range, so this is safe; falls back to a single-threaded download if a chunk request fails for any reason.
+  - `main.py` calls `fetch_mpv_lib()` at startup (no-ops if `mpv-lib/libmpv-2.dll` already exists) — a fresh clone just needs `uv run main.py`. Run `uv run setup_mpv.py --force` to re-fetch manually.
 
-### 4. Terminal Audio Issues
-**Problem:** No sound plays
-**Solution:**
-- Windows: Ensure default audio output device is selected
-- Disable system audio enhancements in device properties
-- Check mpv audio device: `mpv --audio-device-list`
+## Logging
 
-### 5. Textual TUI Issues
-**Problem:** Application crashes or UI doesn't render
-**Solution:** Ensure Textual is installed and Python version is compatible (3.10+)
+All modules log via the shared `"yt-play"` logger — not stdout, since stdout is the TUI. **Session-wise log files**: each run creates its own file, `log/yt-play-{YYYYMMDD-HHMMSS}-{pid}.log` (see `SESSION_ID` in `main.py`, set up before `logging.basicConfig`), with a `SESSION START` banner line. Format includes `(%(threadName)s)` — needed because playback callbacks arrive from mpv's own thread and the stall-watchdog thread, not just the UI thread. When debugging playback/download issues, find the log file matching the run's start time rather than adding print statements.
 
-## Best Practices for AI Agents
+## Known issue: Ctrl+D quit can freeze on the QuitScreen (fix applied 2026-08-12, watch for recurrence)
 
-### When Modifying Player Logic (player.py)
-1. **Use `python-mpv` API** — not subprocess/named pipes. MpvPlayer wraps libmpv.
-2. **Set initial volume explicitly** (`player.volume = 50` after creating MPV instance).
-3. **Always expose a `process` property** for `if self.player.process` guard checks in the app.
-4. **Use `_cleanup()` + lock** for safe teardown. MpvPlayer has a threading lock.
-5. **Register property observers** for `time-pos` and `duration`, and `end-file` event callback.
-6. **Defer initial seek to `playback-restart`** — `play(path, seek_to=N)` stores `_pending_seek` internally. The `playback-restart` event callback applies `seek_absolute()`. Never call `seek_absolute()` right after `play()`; mpv raises `MPV_ERROR_COMMAND (-12)` when still loading.
+Reported: after long playback sessions (hours), pressing Ctrl+D shows the "Stop playback and return to results?" QuitScreen, but Y/N/Esc stop being recognized — app appears frozen.
 
-### When Modifying Screens (main.py)
-1. **Keep screens thin** — UI only. All logic lives on `YouTubePlayerApp`.
-2. **Use `self.app` with type: ignore** to access app methods from screens.
-3. **Callbacks from player thread** must use `self.call_from_thread()` to update screen widgets.
-4. **Check `isinstance(self.screen, PlayerScreen)`** before updating player UI — it may have been popped.
-5. **`@work` methods** return `Worker`, not awaitable. Call without `await`.
-6. **`push_screen` during playback** is fine — the player keeps playing in the background.
-7. **Quit binding** uses `QuitScreen` modal with `push_screen` + callback pattern.
-8. **SeekModal (`g` key)** — `push_screen(SeekModal(duration), callback)`. Modal parses H:MM:SS/M:SS/seconds, validates against duration, dismisses with float or None. Callback calls `player.seek_absolute()`. Guard with `isinstance(self.screen, SeekModal)` to prevent re-entry.
-
-### When Using Config (config.py)
-1. **Import `CONFIG` singleton** — `from config import CONFIG`
-2. **Cache settings live in `CacheConfig`** — max age, cache dir, etc.
-3. **Don't hardcode cache paths** — use `CONFIG` values in search.py
-
-### When Modifying Search Logic (search.py)
-1. **Use `asyncio.create_subprocess_exec`** for async yt-dlp calls.
-2. **`extract_audio_url` returns `(url, error)` tuple** — handle both values.
-3. **Error messages** are derived from stderr content. Keep the heuristics updated.
-4. **Files named `ytplay-{video_id}.{ext}`** — video_id from URL, not random UUID.
-5. **`.done` marker files** track completed downloads; partial files get deleted.
-6. **`_cleanup_cache()`** runs before every new download to purge old files.
-7. **Drain subprocess pipes in `DownloadHandle.kill()`** — close stdout/stderr streams + `p.wait()` after killing. Prevents "unclosed transport" `ValueError: I/O operation on closed pipe` warnings on Windows (Python 3.14+ raises on pipe fileno after close).
-
-### Important Notes
-- **Windows paths:** Use `os.pathsep` for PATH modifications in player.py for DLL loading.
-- **Screen stack:** Textual's screen stack is used naturally. `pop_screen()` pops to the previous screen.
-- **`current_index = -1`** means "no track playing." The guard `0 <= next_index < len(results)` handles auto-advance correctly from this state.
-- **`_advance_to_next`** pops PlayerScreen back to ResultsScreen when queue is exhausted.
-- **Git add on Windows:** Match filename case exactly from `git status` output. `git add AGENTS.md` may silently no-op if the real file is `Agents.md`.
-
-## Dependencies (pyproject.toml)
-```toml
-dependencies = [
-    "textual>=8.2.0",
-    "yt-dlp>=2024.0.0",
-    "python-mpv>=1.0.0",
-]
+**Original theory (watchdog/`call_from_thread` cross-thread deadlock) was disproven by an actual repro log** (`log/yt-play-20260812-162916-8560.log`). Sequence at the freeze:
 ```
-
-## Testing Commands
-```bash
-# Install dev dependencies
-uv sync --dev
-
-# Run all tests
-uv run pytest -v
-
-# Run specific test file
-uv run pytest test/test_search.py -v
-
-# Run by keyword
-uv run pytest -k "extract_video_id"
-
-# Test yt-dlp connectivity
-yt-dlp "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-
-# Test mpv installation
-mpv --version
-
-# Run application
-uv run main.py
+YES PRESSED
+QUIT CALLBACK RESULT=True
+BEFORE player.stop()
+CLEANUP enter
+STOP_WATCHDOG joining thread=mpv-stall-watchdog (timeout=1.0s)
+STOP_WATCHDOG thread=mpv-stall-watchdog joined cleanly   <- watchdog join was fine, took 8ms
+CLEANUP acquiring lock
+CLEANUP lock acquired
+[nothing after this — no "Error during mpv terminate", no "CLEANUP done"]
 ```
+The watchdog join (the originally-suspected deadlock point) completed in 8ms — not the cause. The hang is **inside `self._player.terminate()` itself** (`player.py` `_cleanup()`, the line right after "CLEANUP lock acquired"), which never returns and never raises.
 
-# Record common error here
+**Current theory**: ~40s before the freeze, mpv's own event thread logged:
+```
+(MPVEventHandlerThread) MPV LOG [warn/file] File is apparently being appended to, will keep retrying with timeouts.
+```
+at a position ~4658s (77+ min) into a long video whose download was still trickling in. Likely libmpv's internal demuxer/network thread was mid-retry-loop reading the still-growing file when `terminate()` sent mpv's shutdown/quit command; `python-mpv`'s `terminate()` blocks waiting for the core to fully shut down and **has no timeout of its own** — if the demuxer thread doesn't respond to quit promptly (stuck in that retry-with-timeout loop), `terminate()` hangs indefinitely, which reads to the user as "Y/N not recognized" (the whole UI thread is blocked inside the dismiss callback, so no key events get processed at all).
+
+The process did not self-recover — it was gone from the process list by the time this was checked, i.e. had to be force-killed.
+
+**Still open**: why the demuxer thread doesn't unblock — is it stuck on a Windows file-read of the partially-written download file specifically, or something else in libmpv's shutdown path. No timeout exists anywhere in this call chain, so a hang here is a real freeze, not a self-resolving one like the old watchdog-join theory assumed.
+
+**Instrumentation in place** (already added, keep for next repro):
+- `player.py` `_cleanup()`: logs before/after `_stop_watchdog()`, before/after acquiring `self._lock` — this is what pinned the hang location to `terminate()`.
+- `player.py` `_stop_watchdog()`: logs the `join(timeout=1.0)` call and warns if it times out.
+- `player.py` watchdog stall path and `end-file` event callback: log immediately before/after calling `self.on_end(...)`, tagged with thread name.
+- `main.py` `_on_track_end`: logs before/after `call_from_thread(...)`, tagged with thread name.
+
+**Fix applied**: `MpvPlayer._cleanup()` now detaches `self._player` immediately (under the lock) and calls `_terminate_with_timeout()`, which runs `player.terminate()` on a daemon helper thread (`mpv-terminate-worker`) and only waits up to `TERMINATE_TIMEOUT_SECS` (5.0s). If it doesn't finish in time, the app logs `TERMINATE TIMED OUT` at `CRITICAL`, dumps every thread's Python stack via `_dump_thread_stacks()` (`faulthandler.dump_traceback(all_threads=True)`), and moves on — the hung mpv thread is abandoned (daemon, so it won't block process exit) instead of freezing the UI. This bounds the freeze to ~5s instead of forever, and the next occurrence's log will show exactly what libmpv's internal threads were doing at the moment of the hang (confirms/denies the "stuck retrying reads on a still-growing file" theory for real).
+
+**Log retention**: session log files are now pruned at startup (`main.py` `_cleanup_old_logs()`, mirrors `search.py`'s `_cleanup_cache()` pattern) — enforces both `CONFIG.log_max_age_days` (14 days) and `CONFIG.log_max_count` (20 files), whichever is stricter. Never touches the current session's own log file.

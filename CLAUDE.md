@@ -59,6 +59,7 @@ Streaming directly from YouTube's CDN URL works for in-order playback but seekin
 - `_cleanup_cache()` runs before every new download: removes orphan `.done` markers, files not referenced by any resume-history `video_id`, and history-referenced files older than `CacheConfig.max_cache_age_hours` (7 days).
 - `DownloadHandle.kill()` closes stdout/stderr and calls `p.wait()` after killing — needed to avoid `ValueError: I/O operation on closed pipe` on Windows (Python 3.14+ raises if a pipe fileno is touched after close).
 - `extract_audio_url` / `fetch_video_title` return errors as tuples/fallback strings rather than raising — callers must handle the failure value, not assume success.
+- The output path is resolved **event-driven, not by polling**: yt-dlp's stdout is watched for the `[download] Destination: ...` line as soon as it's printed, instead of stat'ing the download directory every 100ms for a matching filename. `DownloadHandle.wait()` streams stderr incrementally rather than buffering it all via `process.communicate()`.
 
 ### Resume / play history
 
