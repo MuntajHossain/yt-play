@@ -34,7 +34,7 @@ No lint/format config present (no ruff/black/mypy configured) — don't invent o
 All screen/modal classes live in `main.py` (no separate widgets module):
 - **MenuScreen** — entry point, three options: Play History / Search / Play from URL.
 - **HistoryScreen** — lists play history newest-first (list is reversed for display; index math un-reverses on selection). Selecting plays the entry, downloading if not cached.
-- **SearchScreen** — `Input.Submitted` → `app.do_search()`. `$0` repeats the last search and auto-plays the first result.
+- **SearchScreen** — `Input.Submitted` → `app.do_search()`. `$0` repeats the last search and auto-plays the first result. Shows a "Recent:" list backed by `recent_searches` (max 10, deduplicated, newest-first).
 - **ResultsScreen** — `OptionList` of results; selection calls `app.play_at(index)`.
 - **PlayerScreen** — now-playing title, progress bar, live updates from player callbacks.
 - **QuitScreen** — `ModalScreen[bool]`, Y/N/Esc confirmation on `Ctrl+D`.
@@ -60,12 +60,14 @@ Streaming directly from YouTube's CDN URL works for in-order playback but seekin
 - `DownloadHandle.kill()` closes stdout/stderr and calls `p.wait()` after killing — needed to avoid `ValueError: I/O operation on closed pipe` on Windows (Python 3.14+ raises if a pipe fileno is touched after close).
 - `extract_audio_url` / `fetch_video_title` return errors as tuples/fallback strings rather than raising — callers must handle the failure value, not assume success.
 - The output path is resolved **event-driven, not by polling**: yt-dlp's stdout is watched for the `[download] Destination: ...` line as soon as it's printed, instead of stat'ing the download directory every 100ms for a matching filename. `DownloadHandle.wait()` streams stderr incrementally rather than buffering it all via `process.communicate()`.
+- `_ytdlp_cmd()` prefers invoking `python -m yt_dlp` over a `yt-dlp` binary on PATH when the module is importable.
 
 ### Resume / play history
 
 Position is saved to `data/resume_state.json` as a list of per-video entries (keyed by `video_id`, upserted in place), on quit from `PlayerScreen` and every 5s during playback.
 
-- **Resume is a per-video history lookup, not "the last played candidate."** `_play_video_async()` calls `_lookup_history_position(video_id)` whenever `seek_to == 0.0` (the default for search-result and URL playback). This works for *any* previously-watched video regardless of its position in the history array — critical because `_save_resume_data` upserts in place (doesn't move the entry to the end), so `data[-1]` is *not* reliably "most recent."
+- **Resume is a per-video history lookup, not "the last played candidate."** `_play_video_async()` calls `_lookup_history_position(video_id)` whenever `seek_to == 0.0` (the default for search-result and URL playback). `_save_resume_data` removes any existing entry for that `video_id` and appends the new one, so `data[-1]` is the most-recently-played video — but the lookup is still keyed by `video_id`, not array position, so resuming works for *any* previously-watched video reached via search or URL, not just the last one played.
+- History is capped at `MAX_HISTORY` (200) entries; oldest are trimmed once exceeded.
 - `_lookup_history_position` returns `None` if `position >= duration - 5` (near-finished videos start over instead of resuming at EOF).
 - `play_history_entry` passes an explicit `seek_to=position`, bypassing the lookup (position is already known).
 - History is stateless on disk — read fresh on every lookup, no in-memory resume candidate cached at startup.
@@ -81,14 +83,17 @@ Position is saved to `data/resume_state.json` as a list of per-video entries (ke
 - Expose `process` as a bool property (`self._player is not None`) — callers guard on `if self.player.process`.
 - `_cleanup()` uses a threading lock; always goes through `stop()`, never touches `self._player` directly from outside.
 - `_cleanup()` never blocks on `player.terminate()` directly — it's run on a daemon helper thread with a bounded wait (`TERMINATE_TIMEOUT_SECS`, 5.0s) via `_terminate_with_timeout()`, because libmpv's shutdown can hang (see "Known issue" below). A timeout triggers a full thread-stack dump for diagnostics rather than freezing the app.
+- MPV instantiated with buffering tuned for play-while-downloading: `cache=True`, `demuxer_max_bytes="50MiB"`, `demuxer_readahead_secs=60`, `cache_secs=60`. libmpv's own internal log lines are routed into the app's log file via a `log_handler` at `loglevel="info"`.
 
 ### Playback recovery (`main.py`)
 
 `_handle_track_end` distinguishes a genuine end-of-track from a false EOF: if mpv reports a normal end (`error_msg is None`) but the backing `DownloadHandle` isn't done yet, that's treated as recoverable (the file just hasn't grown far enough) rather than "queue advance." Real errors and this false-EOF case both go through `_attempt_recovery()`, which re-extracts/restarts the download and resumes at `max(player.current_time, self._desired_position)`, capped at `MAX_RECOVERY_ATTEMPTS` (3).
 
+`_play_video_async` also scales how much it waits for the file to buffer before starting playback when resuming mid-video (`seek_to > 0`): `min_bytes = max(65536, seek_to * 20000)` and `buffer_timeout = max(15.0, seek_to * 0.05)`, a conservative ~160kbps bitrate estimate — reduces the odds of the false-EOF case above triggering right after a resume seek.
+
 ### Config (`config.py`)
 
-Single `CONFIG` singleton (`CacheConfig` dataclass) — `cache_dir`, `max_cache_age_hours`, `resume_max_age_days`. Import as `from config import CONFIG`; don't hardcode cache paths elsewhere.
+Single `CONFIG` singleton (`CacheConfig` dataclass) — `cache_dir`, `max_cache_age_hours`, `resume_max_age_days`, `log_max_age_days`, `log_max_count` (the latter two used by log retention, see Logging below). Import as `from config import CONFIG`; don't hardcode cache paths elsewhere.
 
 ## Windows-specific notes
 
