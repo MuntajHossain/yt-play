@@ -38,6 +38,7 @@ class MpvPlayer:
         self.current_time = 0.0
         self.duration = 0.0
         self.title = ""
+        self._volume = 80  # persists across play() calls (new mpv instance each track)
 
         # Callbacks – set these before calling play()
         self.on_time_update: Optional[Callable[[float, float], None]] = None
@@ -93,7 +94,7 @@ class MpvPlayer:
             return
 
         player = self._player
-        player.volume = 50
+        player.volume = self._volume
 
         self._last_seek_time = 0.0
         self._last_progress_time = time.monotonic()
@@ -310,19 +311,22 @@ class MpvPlayer:
 
     @property
     def volume(self) -> int:
-        return self._player.volume if self._player else 50
+        return self._player.volume if self._player else self._volume
 
     def set_volume(self, volume: int):
+        self._volume = max(0, min(100, volume))
         if self._player:
-            self._player.volume = max(0, min(100, volume))
+            self._player.volume = self._volume
 
     def volume_up(self, delta: int = 5):
+        self._volume = min(100, self.volume + delta)
         if self._player:
-            self._player.volume = min(100, self._player.volume + delta)
+            self._player.volume = self._volume
 
     def volume_down(self, delta: int = 5):
+        self._volume = max(0, self.volume - delta)
         if self._player:
-            self._player.volume = max(0, self._player.volume - delta)
+            self._player.volume = self._volume
 
     @property
     def speed(self) -> float:
