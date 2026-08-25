@@ -2,6 +2,8 @@
 
 This file provides guidance to AI coding agents (Claude Code, Codex, etc.) when working with code in this repository.
 
+**Sync rule**: `AGENTS.md` and `CLAUDE.md` mirror each other. Any edit to one must be mirrored in the other in the same commit.
+
 ## Project Overview
 
 Terminal-based YouTube audio player. `yt-dlp` for search/stream extraction, `libmpv` (via `python-mpv`) for playback, `textual` for the TUI. Single-package layout — no `src/` dir, four top-level modules: `main.py`, `search.py`, `player.py`, `config.py`.
@@ -18,6 +20,10 @@ uv run pytest -k "extract_video_id"     # by keyword
 ```
 
 No lint/format config present (no ruff/black/mypy configured) — don't invent one, don't run tools that aren't set up.
+
+## Testing policy
+
+Before every commit: run `uv run pytest -v`. If the change adds/alters behavior with no covering test, write one first (`test/test_*.py`). Never commit on a red suite — fix or explain before proceeding.
 
 ## Architecture
 
