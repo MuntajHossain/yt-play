@@ -19,6 +19,10 @@ uv run pytest -k "extract_video_id"     # by keyword
 
 No lint/format config present (no ruff/black/mypy configured) — don't invent one, don't run tools that aren't set up.
 
+## Testing policy
+
+Before every commit: run `uv run pytest -v`. If the change adds/alters behavior with no covering test, write one first (`test/test_*.py`). Never commit on a red suite — fix or explain before proceeding.
+
 ## Architecture
 
 ### Screen stack (Textual `push_screen`/`pop_screen`)
