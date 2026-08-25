@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Sync rule**: `CLAUDE.md` and `AGENTS.md` mirror each other. Any edit to one must be mirrored in the other in the same commit.
+
 ## Project Overview
 
 Terminal-based YouTube audio player. `yt-dlp` for search/stream extraction, `libmpv` (via `python-mpv`) for playback, `textual` for the TUI. Single-package layout — no `src/` dir, four top-level modules: `main.py`, `search.py`, `player.py`, `config.py`.
