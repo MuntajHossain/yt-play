@@ -1,16 +1,20 @@
-"""Tests for search.py — video ID extraction, SearchResult, cache functions.""" 
+"""Tests for search.py — video ID extraction, SearchResult, cache functions."""
 
+import asyncio
 import os
 import time
+from unittest.mock import patch
 
 import pytest
 
+import search as search_module
 from search import (
     _extract_video_id,
     _marker_path,
     _check_cache,
     _cleanup_cache,
     _remove_partial,
+    search_youtube,
     SearchResult,
 )
 from config import CONFIG
@@ -51,6 +55,47 @@ class TestExtractVideoId:
 
     def test_short_id_less_than_11_chars(self):
         assert _extract_video_id("https://youtu.be/short") is None
+
+
+# ---------------------------------------------------------------------------
+# search_youtube pagination
+# ---------------------------------------------------------------------------
+
+class TestSearchYoutubePagination:
+    """search_youtube slices results via --playlist-start/--playlist-end."""
+
+    def _capture_args(self):
+        captured = {}
+
+        async def fake_run_ytdlp(*args):
+            captured["args"] = args
+            return b"", b""
+
+        return captured, fake_run_ytdlp
+
+    def test_page_one_range(self):
+        captured, fake = self._capture_args()
+        with patch.object(search_module, "_run_ytdlp", fake):
+            asyncio.run(search_youtube("test query", page=1, page_size=10))
+        args = captured["args"]
+        assert "ytsearch10" in args
+        assert args[args.index("--playlist-start") + 1] == "1"
+        assert args[args.index("--playlist-end") + 1] == "10"
+
+    def test_page_two_range(self):
+        captured, fake = self._capture_args()
+        with patch.object(search_module, "_run_ytdlp", fake):
+            asyncio.run(search_youtube("test query", page=2, page_size=10))
+        args = captured["args"]
+        assert "ytsearch20" in args
+        assert args[args.index("--playlist-start") + 1] == "11"
+        assert args[args.index("--playlist-end") + 1] == "20"
+
+    def test_empty_stdout_returns_empty_list(self):
+        captured, fake = self._capture_args()
+        with patch.object(search_module, "_run_ytdlp", fake):
+            results = asyncio.run(search_youtube("test query", page=3, page_size=5))
+        assert results == []
 
 
 # ---------------------------------------------------------------------------

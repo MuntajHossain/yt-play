@@ -1,8 +1,10 @@
-"""Tests for main.py — PlayerScreen._fmt, SeekModal, history, app logic.""" 
+"""Tests for main.py — PlayerScreen._fmt, SeekModal, history, app logic."""
 
+import asyncio
 import json
 import os
 import sys
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -193,6 +195,51 @@ class TestHistoryIO:
         assert len(app._read_history()) == 1
 
 
+class TestDeleteHistoryEntry:
+    """delete_history_entry uses HistoryScreen's newest-first index order."""
+
+    def _make_app(self, tmp_path):
+        app = YouTubePlayerApp()
+        resume_file = tmp_path / "resume_state.json"
+        setattr(app, "_resume_path", str(resume_file))
+        return app, resume_file
+
+    def test_delete_newest_entry_at_index_zero(self, tmp_path):
+        app, _ = self._make_app(tmp_path)
+        app._write_history([
+            {"video_id": "old", "title": "Old"},
+            {"video_id": "new", "title": "New"},
+        ])
+        title = app.delete_history_entry(0)
+        assert title == "New"
+        remaining = app._read_history()
+        assert len(remaining) == 1
+        assert remaining[0]["video_id"] == "old"
+
+    def test_delete_oldest_entry_at_last_index(self, tmp_path):
+        app, _ = self._make_app(tmp_path)
+        app._write_history([
+            {"video_id": "old", "title": "Old"},
+            {"video_id": "new", "title": "New"},
+        ])
+        title = app.delete_history_entry(1)
+        assert title == "Old"
+        remaining = app._read_history()
+        assert len(remaining) == 1
+        assert remaining[0]["video_id"] == "new"
+
+    def test_delete_out_of_range_returns_none_and_keeps_history(self, tmp_path):
+        app, _ = self._make_app(tmp_path)
+        app._write_history([{"video_id": "only", "title": "Only"}])
+        assert app.delete_history_entry(5) is None
+        assert app.delete_history_entry(-1) is None
+        assert len(app._read_history()) == 1
+
+    def test_delete_from_empty_history_returns_none(self, tmp_path):
+        app, _ = self._make_app(tmp_path)
+        assert app.delete_history_entry(0) is None
+
+
 class TestLookupHistoryPosition:
     """_lookup_history_position drives resume for any previously-watched video."""
 
@@ -292,3 +339,56 @@ class TestRecentSearches:
         assert len(app.recent_searches) == 10
         assert app.recent_searches[0] == "q14"
         assert app.recent_searches[-1] == "q5"
+
+
+# ------------------------------------------------------------------
+# Search results pagination cache
+# ------------------------------------------------------------------
+
+class TestSearchCachePagination:
+    """_ensure_search_cache fetches one SEARCH_PAGE_SIZE page at a time, lazily, stops on exhaustion."""
+
+    def _make_app(self, query="test"):
+        app = YouTubePlayerApp()
+        app.search_query = query
+        app._search_cache = []
+        app._search_exhausted = False
+        return app
+
+    def test_fetches_pages_until_min_len_covered(self):
+        app = self._make_app()
+        size = app.SEARCH_PAGE_SIZE
+        pages = [[f"r{p * size + i}" for i in range(size)] for p in range(3)]
+        mock = AsyncMock(side_effect=pages)
+        with patch("main.search_youtube", mock):
+            asyncio.run(app._ensure_search_cache(3 * size))
+        assert len(app._search_cache) == 3 * size
+        assert mock.call_count == 3
+        _, kwargs = mock.call_args_list[-1]
+        assert kwargs["page"] == 3
+
+    def test_noop_when_already_cached(self):
+        app = self._make_app()
+        app._search_cache = [f"r{i}" for i in range(app.SEARCH_PAGE_SIZE)]
+        mock = AsyncMock()
+        with patch("main.search_youtube", mock):
+            asyncio.run(app._ensure_search_cache(app.SEARCH_PAGE_SIZE))
+        mock.assert_not_called()
+
+    def test_stops_and_marks_exhausted_on_short_batch(self):
+        app = self._make_app()
+        short_batch = [f"r{i}" for i in range(5)]
+        mock = AsyncMock(side_effect=[short_batch])
+        with patch("main.search_youtube", mock):
+            asyncio.run(app._ensure_search_cache(60))
+        assert app._search_exhausted is True
+        assert len(app._search_cache) == 5
+        mock.assert_called_once()  # doesn't keep retrying once exhausted
+
+    def test_stops_on_empty_batch(self):
+        app = self._make_app()
+        mock = AsyncMock(side_effect=[[]])
+        with patch("main.search_youtube", mock):
+            asyncio.run(app._ensure_search_cache(10))
+        assert app._search_exhausted is True
+        assert app._search_cache == []

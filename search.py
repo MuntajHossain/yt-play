@@ -185,12 +185,27 @@ async def _run_ytdlp(*args: str) -> tuple[bytes, bytes]:
     return await process.communicate()
 
 
-async def search_youtube(query: str, max_results: int = 10) -> List[SearchResult]:
-    """Searches YouTube via yt-dlp and returns structured results."""
+async def search_youtube(
+    query: str, max_results: int = 10, page: int = 1, page_size: Optional[int] = None
+) -> List[SearchResult]:
+    """Searches YouTube via yt-dlp and returns structured results.
+
+    Page 1 returns the first *page_size* (default: *max_results*) results.
+    Page 2+ re-issues the search asking yt-dlp to enumerate through the end
+    of that page (cheap - just a listing), then uses --playlist-start/-end
+    so only that page's videos get fully extracted.
+    """
+    size = page_size or max_results
+    start = (page - 1) * size + 1
+    end = page * size
     stdout, _stderr = await _run_ytdlp(
         "--dump-json",
         "--default-search",
-        f"ytsearch{max_results}",
+        f"ytsearch{end}",
+        "--playlist-start",
+        str(start),
+        "--playlist-end",
+        str(end),
         "--no-playlist",
         "--ignore-errors",
         query,

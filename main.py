@@ -1,3 +1,4 @@
+import asyncio
 import glob
 import json
 import logging
@@ -172,6 +173,7 @@ class HistoryScreen(Screen):
     #history_title { padding: 0 1; }
     #history_list { height: 1fr; }
     #history_empty { padding: 1; text-align: center; text-style: dim; }
+    #history_help { padding: 0 1; text-style: dim; }
     """
 
     def compose(self) -> ComposeResult:
@@ -179,13 +181,18 @@ class HistoryScreen(Screen):
         yield Label("Play History", id="history_title")
         yield OptionList(id="history_list")
         yield Label("No play history yet", id="history_empty")
+        yield Label("[Esc] Back  —  [D]elete selected entry", id="history_help", markup=False)
         yield Footer()
 
     def on_mount(self) -> None:
+        self._populate_list()
+
+    def _populate_list(self, highlight_index: Optional[int] = None) -> None:
         app: YouTubePlayerApp = self.app  # type: ignore
         history = app._read_history()
         option_list = self.query_one("#history_list", OptionList)
         empty_label = self.query_one("#history_empty", Label)
+        option_list.clear_options()
         if not history:
             option_list.display = False
             empty_label.display = True
@@ -201,6 +208,8 @@ class HistoryScreen(Screen):
                 label += f"  [{PlayerScreen._fmt(position)}]"
             option_list.add_option(Option(label, id=f"hist_{i}"))
         option_list.focus()
+        if highlight_index is not None and option_list.option_count:
+            option_list.highlighted = min(highlight_index, option_list.option_count - 1)
 
     async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         app: YouTubePlayerApp = self.app  # type: ignore
@@ -209,6 +218,30 @@ class HistoryScreen(Screen):
     def on_key(self, event) -> None:
         if event.key == "escape":
             self.app.pop_screen()
+        elif event.key in ("d", "delete"):
+            self._delete_selected()
+
+    def _delete_selected(self) -> None:
+        option_list = self.query_one("#history_list", OptionList)
+        index = option_list.highlighted
+        if index is None:
+            return
+        app: YouTubePlayerApp = self.app  # type: ignore
+        history = app._read_history()
+        reversed_history = list(reversed(history))
+        if index >= len(reversed_history):
+            return
+        title = reversed_history[index].get("title", "Unknown")
+
+        def _cb(confirmed: bool) -> None:
+            if not confirmed:
+                return
+            deleted_title = app.delete_history_entry(index)
+            if deleted_title:
+                app.notify(f"Deleted: {deleted_title}", timeout=2)
+            self._populate_list(highlight_index=index)
+
+        self.app.push_screen(QuitScreen(f"Delete '{title}' from history? (y/n)"), _cb)
 
 
 class SearchScreen(Screen):
@@ -262,6 +295,7 @@ class ResultsScreen(Screen):
     ResultsScreen { layout: vertical; }
     #results_title { padding: 0 1; }
     #results_list { height: 1fr; }
+    #results_status { padding: 0 1; text-style: italic; color: $warning; }
     #results_help { padding: 0 1; text-style: dim; }
     """
 
@@ -269,15 +303,25 @@ class ResultsScreen(Screen):
         yield Header(show_clock=True)
         yield Label("Search Results", id="results_title")
         yield OptionList(id="results_list")
-        yield Label("[Esc] Back to search  —  [N]ext  [P]rev  available during playback", id="results_help")
+        yield Label("", id="results_status")
+        yield Label(
+            "[Esc] Back to search  —  [N]ext  [P]rev  available during playback  —  "
+            "[PgDn] Next page  [PgUp] Prev page",
+            id="results_help",
+            markup=False,
+        )
         yield Footer()
 
     def on_mount(self) -> None:
+        self._populate()
+
+    def _populate(self) -> None:
         app: YouTubePlayerApp = self.app  # type: ignore
         results = app.results
         title = self.query_one("#results_title", Label)
         option_list = self.query_one("#results_list", OptionList)
-        title.update(f"Search Results ({len(results)})")
+        self.query_one("#results_status", Label).update("")
+        title.update(f"Search Results ({len(results)}) — Page {app.search_page}")
         option_list.clear_options()
         for i, res in enumerate(results):
             text = f"{res.title} [{res.duration_str}] - {res.uploader}"
@@ -292,6 +336,12 @@ class ResultsScreen(Screen):
     def on_key(self, event) -> None:
         if event.key == "escape":
             self.app.pop_screen()
+        elif event.key == "pagedown":
+            self.query_one("#results_status", Label).update("Loading...")
+            self.app.next_search_page()  # type: ignore
+        elif event.key == "pageup":
+            self.query_one("#results_status", Label).update("Loading...")
+            self.app.prev_search_page()  # type: ignore
 
 
 class SeekModal(ModalScreen[float]):
@@ -415,8 +465,9 @@ class PlayerScreen(Screen):
             yield Label("00:00", id="time_total")
         yield Label(
             "[Space] Play/Pause  [Left/Right] Seek ±5s  [Up/Down] Vol ±5  "
-            "[G]o to position  [N]ext  [P]rev  [[/]] Speed ∓0.25  [Esc] Back  [Ctrl+D] Quit",
+            "[G]o to position  [N]ext  [P]rev  [/] Speed ∓0.25  [Esc] Back  [Ctrl+D] Quit",
             id="controls_help",
+            markup=False,
         )
         yield Footer()
 
@@ -488,6 +539,17 @@ class YouTubePlayerApp(App):
         self.current_index: int = -1
         self.current_title: str = ""
         self.current_youtube_url: str = ""
+
+        self.search_query: str = ""
+        self.search_page: int = 1
+        # yt-dlp's --dump-json fully extracts metadata per video (~3s/video) -
+        # fetching in big batches just multiplies the wait linearly, no economy
+        # of scale. So fetch one page (10) at a time, and prefetch the next
+        # page in the background so PgDn often finds it already cached.
+        self.SEARCH_PAGE_SIZE: int = 10
+        self._search_cache: list = []
+        self._search_exhausted: bool = False
+        self._search_cache_lock = asyncio.Lock()
 
         self._recovery_attempts: int = 0
         self.MAX_RECOVERY_ATTEMPTS: int = 3
@@ -652,6 +714,19 @@ class YouTubePlayerApp(App):
         except Exception:
             log.exception("Failed to write history")
 
+    def delete_history_entry(self, index: int) -> Optional[str]:
+        """Delete history entry at *index* (newest=0, matching HistoryScreen's
+        reversed display order). Returns the deleted entry's title, or None
+        if the index was out of range."""
+        history = self._read_history()
+        orig_index = len(history) - 1 - index
+        if orig_index < 0 or orig_index >= len(history):
+            return None
+        entry = history.pop(orig_index)
+        self._write_history(history)
+        log.info("HISTORY deleted: %s (%d entries remain)", entry.get("video_id"), len(history))
+        return entry.get("title", "Unknown")
+
     def _save_resume_data(self) -> None:
         """Upsert current position into play history — one entry per video_id."""
         if not self.current_youtube_url:
@@ -716,8 +791,13 @@ class YouTubePlayerApp(App):
     @work(exclusive=True)
     async def do_search(self, query: str, auto_play_first: bool = False) -> None:
         log.info("Searching: %s (auto_play=%s)", query, auto_play_first)
-        self.results = await search_youtube(query)
-        log.info("Search returned %d results", len(self.results))
+        self.search_query = query
+        self.search_page = 1
+        self._search_cache = []
+        self._search_exhausted = False
+        await self._ensure_search_cache(self.SEARCH_PAGE_SIZE)
+        self.results = self._search_cache[: self.SEARCH_PAGE_SIZE]
+        log.info("Search returned %d results, showing page 1", len(self.results))
         self.current_index = -1
         self.current_title = ""
         self.current_youtube_url = ""
@@ -732,6 +812,68 @@ class YouTubePlayerApp(App):
             self.play_at(0)
         else:
             self.push_screen(ResultsScreen())
+        self._prefetch_next_page()
+
+    @work(exclusive=True)
+    async def next_search_page(self) -> None:
+        target_page = self.search_page + 1
+        end = target_page * self.SEARCH_PAGE_SIZE
+        await self._ensure_search_cache(end)
+        start = (target_page - 1) * self.SEARCH_PAGE_SIZE
+        if start >= len(self._search_cache):
+            self.notify("No more results", timeout=2)
+            self._clear_results_loading()
+            return
+        self.search_page = target_page
+        self.results = self._search_cache[start:end]
+        self.current_index = -1
+        self._refresh_results_screen()
+        self._prefetch_next_page()
+
+    @work(exclusive=True)
+    async def prev_search_page(self) -> None:
+        if self.search_page <= 1:
+            self.notify("Already on first page", timeout=2)
+            self._clear_results_loading()
+            return
+        self.search_page -= 1
+        start = (self.search_page - 1) * self.SEARCH_PAGE_SIZE
+        end = self.search_page * self.SEARCH_PAGE_SIZE
+        self.results = self._search_cache[start:end]
+        self.current_index = -1
+        self._refresh_results_screen()
+
+    @work(exclusive=True, group="search_prefetch")
+    async def _prefetch_next_page(self) -> None:
+        """Fetch the page after the one just shown, in the background, so a
+        later PgDn often finds it already cached instead of waiting on
+        yt-dlp (~3s/video - see SEARCH_PAGE_SIZE comment above)."""
+        await self._ensure_search_cache((self.search_page + 1) * self.SEARCH_PAGE_SIZE)
+
+    async def _ensure_search_cache(self, min_len: int) -> None:
+        """Fetch further SEARCH_PAGE_SIZE-sized pages until the cache covers
+        *min_len* items or the search is exhausted. Lock-guarded so an
+        explicit page turn and the background prefetch never double-fetch
+        the same page."""
+        async with self._search_cache_lock:
+            while len(self._search_cache) < min_len and not self._search_exhausted:
+                fetch_page = len(self._search_cache) // self.SEARCH_PAGE_SIZE + 1
+                log.info("Fetching search page %d for: %s", fetch_page, self.search_query)
+                batch = await search_youtube(self.search_query, page=fetch_page, page_size=self.SEARCH_PAGE_SIZE)
+                if not batch:
+                    self._search_exhausted = True
+                    break
+                self._search_cache.extend(batch)
+                if len(batch) < self.SEARCH_PAGE_SIZE:
+                    self._search_exhausted = True
+
+    def _refresh_results_screen(self) -> None:
+        if isinstance(self.screen, ResultsScreen):
+            self.screen._populate()
+
+    def _clear_results_loading(self) -> None:
+        if isinstance(self.screen, ResultsScreen):
+            self.screen.query_one("#results_status", Label).update("")
 
     # -- Playback ---------------------------------------------------------
 
