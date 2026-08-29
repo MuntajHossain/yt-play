@@ -4,6 +4,10 @@ This file provides guidance to AI coding agents (Claude Code, Codex, etc.) when 
 
 **Sync rule**: `AGENTS.md` and `CLAUDE.md` mirror each other. Any edit to one must be mirrored in the other in the same commit.
 
+## Output style
+
+Use the `caveman` skill in `ultra` mode (`/caveman ultra`) for all replies: terse caveman-speak at the most aggressive compression. Code, commands, and error output stay exact.
+
 ## Project Overview
 
 Terminal-based YouTube audio player. `yt-dlp` for search/stream extraction, `libmpv` (via `python-mpv`) for playback, `textual` for the TUI. Single-package layout — no `src/` dir, four top-level modules: `main.py`, `search.py`, `player.py`, `config.py`.

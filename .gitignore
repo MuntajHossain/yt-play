@@ -12,6 +12,11 @@ wheels/
 # Project-specific
 .commandcode/
 
+# Agent skills / tooling
+.agents/
+.claude/
+skills-lock.json
+
 # Runtime data & logs
 data/
 log/
