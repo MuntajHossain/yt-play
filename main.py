@@ -954,11 +954,18 @@ class YouTubePlayerApp(App):
             min_bytes = max(min_bytes, int(seek_to * 20000))  # ~160kbps conservative estimate
             buffer_timeout = max(buffer_timeout, seek_to * 0.05)  # assume >=20x realtime download speed
 
-        log.info(
-            "PLAY_VIDEO_ASYNC waiting for initial buffer (min_bytes=%d timeout=%.1f) at %s",
-            min_bytes, buffer_timeout, handle.file_path,
-        )
-        got_data = await wait_for_file_growth(handle.file_path, min_bytes=min_bytes, timeout=buffer_timeout)
+        if handle.is_cached:
+            # Cached file is already complete — no need to wait for it to grow.
+            # The min_bytes estimate can exceed the file's actual size (it's a
+            # conservative bitrate guess), which would otherwise make a complete
+            # cached file look like it never buffered enough and stall forever.
+            got_data = os.path.exists(handle.file_path)
+        else:
+            log.info(
+                "PLAY_VIDEO_ASYNC waiting for initial buffer (min_bytes=%d timeout=%.1f) at %s",
+                min_bytes, buffer_timeout, handle.file_path,
+            )
+            got_data = await wait_for_file_growth(handle.file_path, min_bytes=min_bytes, timeout=buffer_timeout)
 
         if handle.error:
             log.error("PLAY_VIDEO_ASYNC download failed before playable: %s", handle.error)
