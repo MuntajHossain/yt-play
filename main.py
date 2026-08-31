@@ -263,10 +263,20 @@ class SearchScreen(Screen):
 
     def on_mount(self) -> None:
         self.query_one(Input).focus()
+        self._refresh_recent()
+
+    def on_screen_resume(self) -> None:
+        self.query_one("#search_status", Label).update("Press Enter to search")
+        self.query_one(Input).focus()
+        self._refresh_recent()
+
+    def _refresh_recent(self) -> None:
         app: YouTubePlayerApp = self.app  # type: ignore
         if app.recent_searches:
             lines = ["[bold]Recent:[/]"] + [f"  • {q}" for q in app.recent_searches]
             self.query_one("#recent_searches", Label).update("\n".join(lines))
+        else:
+            self.query_one("#recent_searches", Label).update("")
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "search_input":
