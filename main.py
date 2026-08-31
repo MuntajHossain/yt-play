@@ -9,7 +9,7 @@ from typing import Optional
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Header, Footer, Input, OptionList, Label, ProgressBar
+from textual.widgets import Header, Footer, Input, OptionList, Label, ProgressBar, LoadingIndicator
 from textual.widgets.option_list import Option
 from textual.binding import Binding
 from textual import work
@@ -251,12 +251,14 @@ class SearchScreen(Screen):
     Input { margin-bottom: 1; }
     Label { text-align: center; }
     #recent_searches { margin-top: 1; height: auto; }
+    #search_spinner { display: none; height: 1; margin-bottom: 1; }
     """
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical():
             yield SearchInput(placeholder="Search YouTube... ($0 = repeat last)", id="search_input")
+            yield LoadingIndicator(id="search_spinner")
             yield Label("Press Enter to search", id="search_status")
             yield Label("", id="recent_searches")
         yield Footer()
@@ -267,8 +269,12 @@ class SearchScreen(Screen):
 
     def on_screen_resume(self) -> None:
         self.query_one("#search_status", Label).update("Press Enter to search")
+        self._set_loading(False)
         self.query_one(Input).focus()
         self._refresh_recent()
+
+    def _set_loading(self, visible: bool) -> None:
+        self.query_one("#search_spinner", LoadingIndicator).styles.display = "block" if visible else "none"
 
     def _refresh_recent(self) -> None:
         app: YouTubePlayerApp = self.app  # type: ignore
@@ -290,9 +296,11 @@ class SearchScreen(Screen):
                 self.query_one("#search_status", Label).update("No recent search to repeat")
                 return
             self.query_one("#search_status", Label).update("Repeating last search...")
+            self._set_loading(True)
             app.do_search(app.recent_searches[0], auto_play_first=True)
             return
         self.query_one("#search_status", Label).update("Searching...")
+        self._set_loading(True)
         app.do_search(value)
 
     def on_key(self, event) -> None:
@@ -306,6 +314,7 @@ class ResultsScreen(Screen):
     #results_title { padding: 0 1; }
     #results_list { height: 1fr; }
     #results_status { padding: 0 1; text-style: italic; color: $warning; }
+    #results_spinner { display: none; height: 1; padding: 0 1; }
     #results_help { padding: 0 1; text-style: dim; }
     """
 
@@ -314,6 +323,7 @@ class ResultsScreen(Screen):
         yield Label("Search Results", id="results_title")
         yield OptionList(id="results_list")
         yield Label("", id="results_status")
+        yield LoadingIndicator(id="results_spinner")
         yield Label(
             "[Esc] Back to search  —  [N]ext  [P]rev  available during playback  —  "
             "[PgDn] Next page  [PgUp] Prev page",
@@ -331,12 +341,16 @@ class ResultsScreen(Screen):
         title = self.query_one("#results_title", Label)
         option_list = self.query_one("#results_list", OptionList)
         self.query_one("#results_status", Label).update("")
+        self.query_one("#results_spinner", LoadingIndicator).styles.display = "none"
         title.update(f"Search Results ({len(results)}) — Page {app.search_page}")
         option_list.clear_options()
         for i, res in enumerate(results):
             text = f"{res.title} [{res.duration_str}] - {res.uploader}"
             option_list.add_option(Option(text, id=f"result_{i}"))
         self.query_one("#results_list").focus()
+
+    def _set_loading(self, visible: bool) -> None:
+        self.query_one("#results_spinner", LoadingIndicator).styles.display = "block" if visible else "none"
 
     async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "results_list":
@@ -348,9 +362,11 @@ class ResultsScreen(Screen):
             self.app.pop_screen()
         elif event.key == "pagedown":
             self.query_one("#results_status", Label).update("Loading...")
+            self._set_loading(True)
             self.app.next_search_page()  # type: ignore
         elif event.key == "pageup":
             self.query_one("#results_status", Label).update("Loading...")
+            self._set_loading(True)
             self.app.prev_search_page()  # type: ignore
 
 
@@ -463,6 +479,8 @@ class PlayerScreen(Screen):
     #progress_container { height: auto; align: center middle; margin: 0 2; }
     #time_current, #time_total { width: 8; text-align: center; }
     ProgressBar { width: 1fr; margin: 0 1; }
+    #download_status { padding: 0 1; text-align: center; text-style: italic; color: $warning; }
+    #download_spinner { display: none; height: 1; }
     #controls_help { padding: 0 1; text-align: center; text-style: dim; }
     """
 
@@ -473,6 +491,8 @@ class PlayerScreen(Screen):
             yield Label("00:00", id="time_current")
             yield ProgressBar(total=100, show_eta=False, id="progress_bar")
             yield Label("00:00", id="time_total")
+        yield LoadingIndicator(id="download_spinner")
+        yield Label("", id="download_status")
         yield Label(
             "[Space] Play/Pause  [Left/Right] Seek ±5s  [Up/Down] Vol ±5  "
             "[G]o to position  [N]ext  [P]rev  [/] Speed ∓0.25  [Esc] Back  [Ctrl+D] Quit",
@@ -494,6 +514,10 @@ class PlayerScreen(Screen):
             label.update(f"Now Playing: {title}")
         else:
             label.update("Now Playing: Nothing")
+
+    def set_downloading(self, visible: bool) -> None:
+        self.query_one("#download_spinner", LoadingIndicator).styles.display = "block" if visible else "none"
+        self.query_one("#download_status", Label).update("Downloading..." if visible else "")
 
     def update_progress(self, current_time: float, duration: float) -> None:
         """Called from the player callback – always on the main thread."""
@@ -884,6 +908,7 @@ class YouTubePlayerApp(App):
     def _clear_results_loading(self) -> None:
         if isinstance(self.screen, ResultsScreen):
             self.screen.query_one("#results_status", Label).update("")
+            self.screen._set_loading(False)
 
     # -- Playback ---------------------------------------------------------
 
@@ -944,6 +969,9 @@ class YouTubePlayerApp(App):
 
         self._active_download = handle
 
+        if not handle.is_cached and isinstance(self.screen, PlayerScreen):
+            self.screen.set_downloading(True)
+
         if not handle.file_path:
             log.error("PLAY_VIDEO_ASYNC download file path never appeared on disk")
             self.notify("Failed to locate downloaded file", title="Error", severity="error")
@@ -999,6 +1027,7 @@ class YouTubePlayerApp(App):
         player_screen = self.screen
         if isinstance(player_screen, PlayerScreen):
             player_screen.update_now_playing(title)
+            player_screen.set_downloading(False)
 
         # Let the download finish in the background; log its outcome.
         await handle.wait()
