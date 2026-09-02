@@ -54,6 +54,11 @@ class MpvPlayer:
         self._watchdog_stop = threading.Event()
         self._stall_reported = False
         self._pending_seek: Optional[float] = None
+        # Bumped on every play() so a still-shutting-down previous mpv
+        # instance's callbacks (fired from its own event thread, possibly
+        # well after play() has moved on to a new instance) can tell they're
+        # stale and must not touch app state via self.on_end.
+        self._generation = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -64,6 +69,14 @@ class MpvPlayer:
         """Whether a player instance is active."""
         return self._player is not None
 
+    def _is_stale(self, generation: int) -> bool:
+        """True if *generation* (captured by a play()'s callbacks/watchdog at
+        creation time) no longer matches the live instance — i.e. a later
+        play() has since superseded it. Used to drop events from an mpv
+        instance that's still shutting down (or stuck shutting down — see
+        TERMINATE_TIMEOUT_SECS) when a new one has already replaced it."""
+        return generation != self._generation
+
     def play(self, url: str, seek_to: float = 0.0):
         """Start playing *url* (audio-only) through a new mpv instance.
 
@@ -71,6 +84,8 @@ class MpvPlayer:
         playback-restart (avoids MPV_ERROR_COMMAND when mpv is still
         loading the file).
         """
+        self._generation += 1
+        generation = self._generation
         self.stop()
         self._pending_seek = seek_to if seek_to > 0 else None
 
@@ -104,6 +119,8 @@ class MpvPlayer:
         # Register property observers for time / duration
         @player.property_observer("time-pos")
         def _on_time_pos(_name, value):
+            if self._is_stale(generation):
+                return
             if value is not None:
                 self.current_time = float(value)
                 if self.current_time != self._last_seen_pos:
@@ -116,6 +133,8 @@ class MpvPlayer:
 
         @player.property_observer("duration")
         def _on_duration(_name, value):
+            if self._is_stale(generation):
+                return
             if value is not None:
                 self.duration = float(value)
 
@@ -149,6 +168,12 @@ class MpvPlayer:
         # Register end-file event
         @player.event_callback("end-file")
         def _on_end_file(event):
+            if self._is_stale(generation):
+                log.info(
+                    "END_FILE ignored: stale generation=%d (current=%d)",
+                    generation, self._generation,
+                )
+                return
             self.is_playing = False
             error_msg: Optional[str] = None
             reason = getattr(event, "reason", None)
@@ -178,7 +203,7 @@ class MpvPlayer:
             self._cleanup()
             return
 
-        self._start_watchdog()
+        self._start_watchdog(generation)
 
     def toggle_pause(self):
         if self._player:
@@ -244,10 +269,10 @@ class MpvPlayer:
     # Stall watchdog
     # ------------------------------------------------------------------
 
-    def _start_watchdog(self):
+    def _start_watchdog(self, generation: int):
         self._watchdog_stop.clear()
         self._watchdog_thread = threading.Thread(
-            target=self._watchdog_loop, name="mpv-stall-watchdog", daemon=True
+            target=self._watchdog_loop, args=(generation,), name="mpv-stall-watchdog", daemon=True
         )
         self._watchdog_thread.start()
         log.info("WATCHDOG started")
@@ -268,8 +293,10 @@ class MpvPlayer:
                 log.info("STOP_WATCHDOG thread=%s joined cleanly", t.name)
         self._watchdog_thread = None
 
-    def _watchdog_loop(self):
+    def _watchdog_loop(self, generation: int):
         while not self._watchdog_stop.wait(1.0):
+            if self._is_stale(generation):
+                return
             player = self._player
             if not player:
                 continue
@@ -303,6 +330,8 @@ class MpvPlayer:
             self._stall_reported = True
             self.is_playing = False
             stuck_pos = self.current_time
+            if self._is_stale(generation):
+                return
             if self.on_end:
                 log.warning("WATCHDOG calling on_end (stall) from thread=%s", threading.current_thread().name)
                 self.on_end(f"Playback stalled at {stuck_pos:.1f}s (cache exhausted after seek)")

@@ -28,7 +28,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] (%(threadName)s) %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(CURRENT_LOG_FILE),
+        logging.FileHandler(CURRENT_LOG_FILE, encoding="utf-8"),
     ],
 )
 log = logging.getLogger("yt-play")
@@ -184,7 +184,22 @@ class HistoryScreen(Screen):
         yield Label("[Esc] Back  —  [D]elete selected entry", id="history_help", markup=False)
         yield Footer()
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Snapshot of the entries currently on screen, newest-first (same
+        # order as the OptionList) — frozen at populate time so a selection
+        # always maps to what the user actually sees, even if playback in
+        # the background upserts (and reorders) history while this screen
+        # is open. Re-taken on every mount/resume, not on every play.
+        self._entries: list = []
+
     def on_mount(self) -> None:
+        self._populate_list()
+
+    def on_screen_resume(self) -> None:
+        # Refresh so returning here (e.g. Esc from PlayerScreen) shows the
+        # up-to-date order — but note this is the ONLY time the order is
+        # re-taken; it then stays frozen for the rest of this visit.
         self._populate_list()
 
     def _populate_list(self, highlight_index: Optional[int] = None) -> None:
@@ -193,14 +208,17 @@ class HistoryScreen(Screen):
         option_list = self.query_one("#history_list", OptionList)
         empty_label = self.query_one("#history_empty", Label)
         option_list.clear_options()
-        if not history:
+        # Newest first — snapshot this order now; it's what on_option_list_
+        # option_selected and _delete_selected will resolve indices against,
+        # regardless of any later background reordering.
+        self._entries = list(reversed(history))
+        if not self._entries:
             option_list.display = False
             empty_label.display = True
             return
         empty_label.display = False
         option_list.display = True
-        # Newest first
-        for i, entry in enumerate(reversed(history)):
+        for i, entry in enumerate(self._entries):
             title = entry.get("title", "Unknown")
             position = entry.get("position", 0.0)
             label = f"{title}"
@@ -212,8 +230,10 @@ class HistoryScreen(Screen):
             option_list.highlighted = min(highlight_index, option_list.option_count - 1)
 
     async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_index >= len(self._entries):
+            return
         app: YouTubePlayerApp = self.app  # type: ignore
-        app.play_history_entry(event.option_index)
+        app.play_history_entry(self._entries[event.option_index])
 
     def on_key(self, event) -> None:
         if event.key == "escape":
@@ -224,19 +244,17 @@ class HistoryScreen(Screen):
     def _delete_selected(self) -> None:
         option_list = self.query_one("#history_list", OptionList)
         index = option_list.highlighted
-        if index is None:
+        if index is None or index >= len(self._entries):
             return
         app: YouTubePlayerApp = self.app  # type: ignore
-        history = app._read_history()
-        reversed_history = list(reversed(history))
-        if index >= len(reversed_history):
-            return
-        title = reversed_history[index].get("title", "Unknown")
+        entry = self._entries[index]
+        title = entry.get("title", "Unknown")
+        video_id = entry.get("video_id")
 
         def _cb(confirmed: bool) -> None:
             if not confirmed:
                 return
-            deleted_title = app.delete_history_entry(index)
+            deleted_title = app.delete_history_entry(video_id)
             if deleted_title:
                 app.notify(f"Deleted: {deleted_title}", timeout=2)
             self._populate_list(highlight_index=index)
@@ -608,17 +626,13 @@ class YouTubePlayerApp(App):
     def go_to_search(self) -> None:
         self.push_screen(SearchScreen())
 
-    def play_history_entry(self, index: int) -> None:
-        """Play from history: newest=0. If cached, play directly; else download."""
-        history = self._read_history()
-        if not history:
-            self.notify("No history entries", timeout=2)
-            return
-        # history list reversed in screen — reverse back
-        reversed_history = list(reversed(history))
-        if index < 0 or index >= len(reversed_history):
-            return
-        entry = reversed_history[index]
+    def play_history_entry(self, entry: dict) -> None:
+        """Play a specific history entry (as shown by HistoryScreen). Takes
+        the entry itself rather than a position/index — background playback
+        upserts history (moving the just-played video to the top) while
+        HistoryScreen may be sitting open with an older snapshot on screen,
+        so resolving by index against a fresh read would silently play a
+        different entry than the one the user actually selected."""
         video_id = entry.get("video_id")
         title = entry.get("title", "Unknown")
         url = entry.get("url", "")
@@ -748,18 +762,22 @@ class YouTubePlayerApp(App):
         except Exception:
             log.exception("Failed to write history")
 
-    def delete_history_entry(self, index: int) -> Optional[str]:
-        """Delete history entry at *index* (newest=0, matching HistoryScreen's
-        reversed display order). Returns the deleted entry's title, or None
-        if the index was out of range."""
-        history = self._read_history()
-        orig_index = len(history) - 1 - index
-        if orig_index < 0 or orig_index >= len(history):
+    def delete_history_entry(self, video_id: Optional[str]) -> Optional[str]:
+        """Delete the history entry matching *video_id*. Matches by identity
+        rather than position — same reasoning as play_history_entry — so a
+        HistoryScreen showing a stale (pre-reorder) snapshot still deletes
+        the entry the user actually picked. Returns the deleted entry's
+        title, or None if not found."""
+        if not video_id:
             return None
-        entry = history.pop(orig_index)
-        self._write_history(history)
-        log.info("HISTORY deleted: %s (%d entries remain)", entry.get("video_id"), len(history))
-        return entry.get("title", "Unknown")
+        history = self._read_history()
+        for i, entry in enumerate(history):
+            if entry.get("video_id") == video_id:
+                history.pop(i)
+                self._write_history(history)
+                log.info("HISTORY deleted: %s (%d entries remain)", video_id, len(history))
+                return entry.get("title", "Unknown")
+        return None
 
     def _save_resume_data(self) -> None:
         """Upsert current position into play history — one entry per video_id."""
