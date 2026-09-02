@@ -42,3 +42,23 @@ class TestVolumePersistence:
         p.set_volume(3)
         p.volume_down(10)
         assert p.volume == 0
+
+
+class TestStaleGeneration:
+    """A previous mpv instance's callbacks/watchdog capture the generation
+    live at their play() call. Once a later play() bumps self._generation,
+    that captured value must read as stale — this is what stops a delayed
+    end-file from a still-shutting-down old instance (see play()'s internal
+    self.stop() call, and the Ctrl+D terminate-hang known issue) from firing
+    self.on_end and corrupting app state meant for the new instance."""
+
+    def test_current_generation_is_not_stale(self):
+        p = MpvPlayer()
+        assert not p._is_stale(p._generation)
+
+    def test_superseded_generation_is_stale(self):
+        p = MpvPlayer()
+        old_generation = p._generation
+        p._generation += 1
+        assert p._is_stale(old_generation)
+        assert not p._is_stale(p._generation)

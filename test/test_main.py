@@ -196,7 +196,10 @@ class TestHistoryIO:
 
 
 class TestDeleteHistoryEntry:
-    """delete_history_entry uses HistoryScreen's newest-first index order."""
+    """delete_history_entry matches by video_id, not position — a
+    HistoryScreen showing a stale (pre-reorder) snapshot must still delete
+    the entry the user actually picked, not whatever now sits at that
+    index in a freshly re-read (and possibly reordered) history."""
 
     def _make_app(self, tmp_path):
         app = YouTubePlayerApp()
@@ -204,40 +207,47 @@ class TestDeleteHistoryEntry:
         setattr(app, "_resume_path", str(resume_file))
         return app, resume_file
 
-    def test_delete_newest_entry_at_index_zero(self, tmp_path):
+    def test_delete_by_video_id(self, tmp_path):
         app, _ = self._make_app(tmp_path)
         app._write_history([
             {"video_id": "old", "title": "Old"},
             {"video_id": "new", "title": "New"},
         ])
-        title = app.delete_history_entry(0)
+        title = app.delete_history_entry("new")
         assert title == "New"
         remaining = app._read_history()
         assert len(remaining) == 1
         assert remaining[0]["video_id"] == "old"
 
-    def test_delete_oldest_entry_at_last_index(self, tmp_path):
+    def test_delete_survives_background_reorder(self, tmp_path):
+        """Simulates HistoryScreen holding a stale snapshot: deleting "old"
+        must remove "old" even after "new" was re-upserted to the end
+        in between (order changed, identity-based delete is unaffected)."""
         app, _ = self._make_app(tmp_path)
         app._write_history([
             {"video_id": "old", "title": "Old"},
             {"video_id": "new", "title": "New"},
         ])
-        title = app.delete_history_entry(1)
+        app._write_history([
+            {"video_id": "old", "title": "Old"},
+            {"video_id": "new", "title": "New"},
+        ])
+        title = app.delete_history_entry("old")
         assert title == "Old"
         remaining = app._read_history()
         assert len(remaining) == 1
         assert remaining[0]["video_id"] == "new"
 
-    def test_delete_out_of_range_returns_none_and_keeps_history(self, tmp_path):
+    def test_delete_unknown_video_id_returns_none_and_keeps_history(self, tmp_path):
         app, _ = self._make_app(tmp_path)
         app._write_history([{"video_id": "only", "title": "Only"}])
-        assert app.delete_history_entry(5) is None
-        assert app.delete_history_entry(-1) is None
+        assert app.delete_history_entry("missing") is None
+        assert app.delete_history_entry(None) is None
         assert len(app._read_history()) == 1
 
     def test_delete_from_empty_history_returns_none(self, tmp_path):
         app, _ = self._make_app(tmp_path)
-        assert app.delete_history_entry(0) is None
+        assert app.delete_history_entry("anything") is None
 
 
 class TestLookupHistoryPosition:
