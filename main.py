@@ -1,8 +1,10 @@
+import argparse
 import asyncio
 import glob
 import json
 import logging
 import os
+import random
 import threading
 import time
 from typing import Optional
@@ -13,9 +15,43 @@ from textual.widgets import Header, Footer, Input, OptionList, Label, ProgressBa
 from textual.widgets.option_list import Option
 from textual.binding import Binding
 from textual import work
+from textual.worker import get_current_worker
 
-from search import search_youtube, start_audio_download, wait_for_file_growth, DownloadHandle, _extract_video_id
+from search import (
+    search_youtube,
+    start_audio_download,
+    wait_for_file_growth,
+    DownloadHandle,
+    SearchResult,
+    format_duration,
+    _extract_video_id,
+    _marker_path,
+)
 from config import CONFIG
+import playlist
+
+APP_VERSION = "0.2.0"
+
+
+def _parse_cli_args() -> None:
+    """Handle -h/--version before any of the module's heavy import-time side
+    effects (log file creation, mpv-lib fetch) run. Guarded by __name__ so
+    importing this module (tests, the entry point) never parses argv.
+    """
+    parser = argparse.ArgumentParser(
+        prog="ytplay",
+        description="Terminal-based YouTube audio player - search YouTube, "
+        "stream audio via yt-dlp + mpv, resume where you left off.",
+    )
+    parser.add_argument("--version", action="store_true", help="print the version and exit")
+    args = parser.parse_args()
+    if args.version:
+        print(f"ytplay {APP_VERSION}")
+        raise SystemExit(0)
+
+
+if __name__ == "__main__":
+    _parse_cli_args()
 
 LOG_DIR = "log"
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -88,6 +124,35 @@ except Exception:
 
 from player import MpvPlayer
 
+
+def _resolve_recent_ref(value: str, recent: list) -> Optional[str]:
+    """Map a ``$N`` token to ``recent[N]`` (``$0`` = newest). ``None`` if *value*
+    isn't a ``$N`` token or N is out of range."""
+    if len(value) < 2 or value[0] != "$" or not value[1:].isdigit():
+        return None
+    index = int(value[1:])
+    return recent[index] if index < len(recent) else None
+
+
+def _play_notification_sound() -> None:
+    """Short audible cue that search results are ready. Never raises."""
+    try:
+        import winsound
+    except ImportError:
+        print("\a", end="", flush=True)
+        return
+
+    def _chime() -> None:
+        # Rising three-note arpeggio (C5-E5-G5): distinct from Windows' own alert sounds.
+        # winsound.Beep blocks, so this runs on a daemon thread.
+        try:
+            for freq, ms in ((523, 90), (659, 90), (784, 160)):
+                winsound.Beep(freq, ms)
+        except Exception:
+            log.exception("Notification sound failed")
+
+    threading.Thread(target=_chime, name="notify-chime", daemon=True).start()
+
 # ---------------------------------------------------------------------------
 # Widgets
 # ---------------------------------------------------------------------------
@@ -134,7 +199,7 @@ class MenuScreen(Screen):
     MenuScreen { align: center middle; }
     MenuScreen Vertical { width: 40; height: auto; margin: 1; }
     #menu_title { text-align: center; text-style: bold; padding-bottom: 1; }
-    #menu_list { margin-top: 1; height: 5; }
+    #menu_list { margin-top: 1; height: 6; }
     """
 
     def compose(self) -> ComposeResult:
@@ -149,6 +214,7 @@ class MenuScreen(Screen):
         menu.add_option(Option("▶  Play History", id="menu_history"))
         menu.add_option(Option("🔍  Search", id="menu_search"))
         menu.add_option(Option("🔗  Play from URL", id="menu_url"))
+        menu.add_option(Option("📃  Playlists", id="menu_playlists"))
         menu.focus()
 
     async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
@@ -159,6 +225,8 @@ class MenuScreen(Screen):
             app.go_to_search()
         elif event.option_id == "menu_url":
             app.action_play_from_url()
+        elif event.option_id == "menu_playlists":
+            app.go_to_playlists()
 
     def on_key(self, event) -> None:
         if event.key == "escape":
@@ -275,7 +343,7 @@ class SearchScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical():
-            yield SearchInput(placeholder="Search YouTube... ($0 = repeat last)", id="search_input")
+            yield SearchInput(placeholder="Search YouTube... ($0, $1... = repeat recent)", id="search_input")
             yield LoadingIndicator(id="search_spinner")
             yield Label("Press Enter to search", id="search_status")
             yield Label("", id="recent_searches")
@@ -297,7 +365,7 @@ class SearchScreen(Screen):
     def _refresh_recent(self) -> None:
         app: YouTubePlayerApp = self.app  # type: ignore
         if app.recent_searches:
-            lines = ["[bold]Recent:[/]"] + [f"  • {q}" for q in app.recent_searches]
+            lines = ["[bold]Recent:[/]"] + [f"  ${i}  {q}" for i, q in enumerate(app.recent_searches)]
             self.query_one("#recent_searches", Label).update("\n".join(lines))
         else:
             self.query_one("#recent_searches", Label).update("")
@@ -309,13 +377,14 @@ class SearchScreen(Screen):
         if not value:
             return
         app: YouTubePlayerApp = self.app  # type: ignore
-        if value == "$0":
-            if not app.recent_searches:
-                self.query_one("#search_status", Label).update("No recent search to repeat")
+        if value.startswith("$") and value[1:].isdigit():
+            query = _resolve_recent_ref(value, app.recent_searches)
+            if query is None:
+                self.query_one("#search_status", Label).update(f"No recent search at {value}")
                 return
-            self.query_one("#search_status", Label).update("Repeating last search...")
+            self.query_one("#search_status", Label).update(f"Repeating: {query}")
             self._set_loading(True)
-            app.do_search(app.recent_searches[0], auto_play_first=True)
+            app.do_search(query, auto_play_first=True)
             return
         self.query_one("#search_status", Label).update("Searching...")
         self._set_loading(True)
@@ -490,6 +559,256 @@ class UrlModal(ModalScreen[str]):
         self.dismiss(url)
 
 
+class NewPlaylistModal(ModalScreen[str]):
+    """Input modal for a new playlist name. Dismisses with the name or None."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
+
+    CSS = """
+    NewPlaylistModal { align: center middle; }
+    #new_playlist_dialog { width: 50; padding: 1 2; border: thick $primary; background: $surface; }
+    #new_playlist_label { text-align: center; padding-bottom: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="new_playlist_dialog"):
+            yield Label("New playlist name:", id="new_playlist_label")
+            yield Input(placeholder="e.g. Chill Mix", id="new_playlist_input")
+
+    def on_mount(self) -> None:
+        self.query_one("#new_playlist_input", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        name = event.input.value.strip()
+        self.dismiss(name or None)
+
+
+class AddToPlaylistModal(ModalScreen[str]):
+    """Pick an existing playlist or type a new name. Dismisses with the
+    chosen/typed playlist name, or None on cancel."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
+
+    CSS = """
+    AddToPlaylistModal { align: center middle; }
+    #add_to_playlist_dialog { width: 50; height: auto; padding: 1 2; border: thick $primary; background: $surface; }
+    #add_to_playlist_label { text-align: center; padding-bottom: 1; }
+    #existing_playlists { height: 8; margin-bottom: 1; }
+    """
+
+    def __init__(self, names: list) -> None:
+        super().__init__()
+        self._names = names
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="add_to_playlist_dialog"):
+            yield Label("Add to Playlist", id="add_to_playlist_label")
+            if self._names:
+                yield OptionList(
+                    *[Option(name, id=f"pl_{i}") for i, name in enumerate(self._names)],
+                    id="existing_playlists",
+                )
+            yield Input(placeholder="Or type a new playlist name...", id="new_playlist_name_input")
+
+    def on_mount(self) -> None:
+        if self._names:
+            self.query_one("#existing_playlists", OptionList).focus()
+        else:
+            self.query_one("#new_playlist_name_input", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(self._names[event.option_index])
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        name = event.input.value.strip()
+        if name:
+            self.dismiss(name)
+
+
+class PlaylistsScreen(Screen):
+    """List playlists; select to open, N to create, D to delete."""
+
+    CSS = """
+    PlaylistsScreen { layout: vertical; }
+    #playlists_title { padding: 0 1; }
+    #playlists_list { height: 1fr; }
+    #playlists_empty { padding: 1; text-align: center; text-style: dim; }
+    #playlists_help { padding: 0 1; text-style: dim; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Label("Playlists", id="playlists_title")
+        yield OptionList(id="playlists_list")
+        yield Label("No playlists yet", id="playlists_empty")
+        yield Label("[Esc] Back  [Enter] Open  [N]ew  [D]elete", id="playlists_help", markup=False)
+        yield Footer()
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._playlists: list = []
+
+    def on_mount(self) -> None:
+        self._populate_list()
+
+    def on_screen_resume(self) -> None:
+        self._populate_list()
+
+    def _populate_list(self) -> None:
+        self._playlists = playlist.read_playlists()
+        option_list = self.query_one("#playlists_list", OptionList)
+        empty_label = self.query_one("#playlists_empty", Label)
+        option_list.clear_options()
+        if not self._playlists:
+            option_list.display = False
+            empty_label.display = True
+            return
+        empty_label.display = False
+        option_list.display = True
+        for i, pl in enumerate(self._playlists):
+            option_list.add_option(Option(f"{pl.name}  ({len(pl.videos)} videos)", id=f"playlist_{i}"))
+        option_list.focus()
+
+    async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_index >= len(self._playlists):
+            return
+        self.app.push_screen(PlaylistDetailScreen(self._playlists[event.option_index].name))
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.app.pop_screen()
+        elif event.key == "n":
+            self._new_playlist()
+        elif event.key in ("d", "delete"):
+            self._delete_selected()
+
+    def _new_playlist(self) -> None:
+        def _cb(name: Optional[str]) -> None:
+            if not name:
+                return
+            playlists = playlist.read_playlists()
+            playlist.create_playlist(playlists, name)
+            playlist.write_playlists(playlists)
+            self._populate_list()
+
+        self.app.push_screen(NewPlaylistModal(), _cb)
+
+    def _delete_selected(self) -> None:
+        option_list = self.query_one("#playlists_list", OptionList)
+        index = option_list.highlighted
+        if index is None or index >= len(self._playlists):
+            return
+        name = self._playlists[index].name
+
+        def _cb(confirmed: bool) -> None:
+            if not confirmed:
+                return
+            playlists = playlist.read_playlists()
+            if playlist.delete_playlist(playlists, name):
+                playlist.write_playlists(playlists)
+                self.app.notify(f"Deleted playlist: {name}", timeout=2)
+            self._populate_list()
+
+        self.app.push_screen(QuitScreen(f"Delete playlist '{name}'? (y/n)"), _cb)
+
+
+class PlaylistDetailScreen(Screen):
+    """List videos in one playlist; select to play from there, D to remove."""
+
+    CSS = """
+    PlaylistDetailScreen { layout: vertical; }
+    #playlist_detail_title { padding: 0 1; }
+    #playlist_videos { height: 1fr; }
+    #playlist_detail_empty { padding: 1; text-align: center; text-style: dim; }
+    #playlist_detail_help { padding: 0 1; text-style: dim; }
+    """
+
+    def __init__(self, playlist_name: str, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._playlist_name = playlist_name
+        self._videos: list = []
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Label(self._playlist_name, id="playlist_detail_title")
+        yield OptionList(id="playlist_videos")
+        yield Label("No videos in this playlist yet", id="playlist_detail_empty")
+        yield Label(
+            "[Esc] Back  [Enter] Play from here  [D]elete video  —  "
+            "[R]epeat and [S]huffle are global, available during playback",
+            id="playlist_detail_help",
+            markup=False,
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._populate_list()
+
+    def on_screen_resume(self) -> None:
+        self._populate_list()
+
+    def _populate_list(self, highlight_index: Optional[int] = None) -> None:
+        playlists = playlist.read_playlists()
+        pl = playlist.get_playlist(playlists, self._playlist_name)
+        self._videos = pl.videos if pl else []
+        option_list = self.query_one("#playlist_videos", OptionList)
+        empty_label = self.query_one("#playlist_detail_empty", Label)
+        title = self.query_one("#playlist_detail_title", Label)
+        title.update(f"{self._playlist_name}  ({len(self._videos)} videos)")
+        option_list.clear_options()
+        if not self._videos:
+            option_list.display = False
+            empty_label.display = True
+            return
+        empty_label.display = False
+        option_list.display = True
+        for i, v in enumerate(self._videos):
+            option_list.add_option(Option(f"{v.title}  [{v.duration_str}] - {v.uploader}", id=f"plvid_{i}"))
+        option_list.focus()
+        if highlight_index is not None and option_list.option_count:
+            option_list.highlighted = min(highlight_index, option_list.option_count - 1)
+
+    async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_index >= len(self._videos):
+            return
+        app: YouTubePlayerApp = self.app  # type: ignore
+        app.play_playlist(self._playlist_name, start_index=event.option_index)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.app.pop_screen()
+        elif event.key in ("d", "delete"):
+            self._delete_selected()
+
+    def _delete_selected(self) -> None:
+        option_list = self.query_one("#playlist_videos", OptionList)
+        index = option_list.highlighted
+        if index is None or index >= len(self._videos):
+            return
+        video = self._videos[index]
+
+        def _cb(confirmed: bool) -> None:
+            if not confirmed:
+                return
+            playlists = playlist.read_playlists()
+            if playlist.remove_video_from_playlist(playlists, self._playlist_name, video.id):
+                playlist.write_playlists(playlists)
+                self.app.notify(f"Removed: {video.title}", timeout=2)
+            self._populate_list(highlight_index=index)
+
+        self.app.push_screen(QuitScreen(f"Remove '{video.title}' from playlist? (y/n)"), _cb)
+
+
 class PlayerScreen(Screen):
     CSS = """
     PlayerScreen { layout: vertical; }
@@ -499,6 +818,7 @@ class PlayerScreen(Screen):
     ProgressBar { width: 1fr; margin: 0 1; }
     #download_status { padding: 0 1; text-align: center; text-style: italic; color: $warning; }
     #download_spinner { display: none; height: 1; }
+    #playback_modes { padding: 0 1; text-align: center; text-style: bold; color: $success; height: 1; }
     #controls_help { padding: 0 1; text-align: center; text-style: dim; }
     """
 
@@ -511,9 +831,11 @@ class PlayerScreen(Screen):
             yield Label("00:00", id="time_total")
         yield LoadingIndicator(id="download_spinner")
         yield Label("", id="download_status")
+        yield Label("", id="playback_modes")
         yield Label(
             "[Space] Play/Pause  [Left/Right] Seek ±5s  [Up/Down] Vol ±5  "
-            "[G]o to position  [N]ext  [P]rev  [/] Speed ∓0.25  [Esc] Back  [Ctrl+D] Quit",
+            "[G]o to position  [N]ext  [P]rev  [/] Speed ∓0.25  [Ctrl+P] Add to Playlist  "
+            "[R]epeat  [S]huffle  [Esc] Back  [Ctrl+D] Quit",
             id="controls_help",
             markup=False,
         )
@@ -522,6 +844,7 @@ class PlayerScreen(Screen):
     def on_mount(self) -> None:
         app: YouTubePlayerApp = self.app  # type: ignore
         self._update_now_playing(app.current_title)
+        self.update_modes(app.repeat_enabled, app.shuffle_enabled)
 
     def update_now_playing(self, title: str) -> None:
         self._update_now_playing(title)
@@ -532,6 +855,14 @@ class PlayerScreen(Screen):
             label.update(f"Now Playing: {title}")
         else:
             label.update("Now Playing: Nothing")
+
+    def update_modes(self, repeat_enabled: bool, shuffle_enabled: bool) -> None:
+        parts = []
+        if repeat_enabled:
+            parts.append("Repeat: On")
+        if shuffle_enabled:
+            parts.append("Shuffle: On")
+        self.query_one("#playback_modes", Label).update("  ".join(parts))
 
     def set_downloading(self, visible: bool) -> None:
         self.query_one("#download_spinner", LoadingIndicator).styles.display = "block" if visible else "none"
@@ -578,6 +909,9 @@ class YouTubePlayerApp(App):
         ("p", "prev_track", "Prev"),
         ("]", "speed_up", "Speed +"),
         ("[", "speed_down", "Speed -"),
+        ("ctrl+p", "add_to_playlist", "Add to Playlist"),
+        ("r", "toggle_repeat", "Repeat"),
+        ("s", "toggle_shuffle", "Shuffle"),
     ]
 
     def __init__(self):
@@ -591,6 +925,15 @@ class YouTubePlayerApp(App):
         self.current_index: int = -1
         self.current_title: str = ""
         self.current_youtube_url: str = ""
+        # True while self.results holds a playlist's videos rather than search
+        # results — suppresses history-position resume (a playlist play is an
+        # explicit "from the top" action) and is reset whenever another source
+        # (search/history/URL) repopulates self.results.
+        self._queue_is_playlist: bool = False
+
+        self.repeat_enabled: bool = False  # replays the current track on natural end
+        self.shuffle_enabled: bool = False
+        self._shuffle_order: list = []  # permutation of range(len(self.results)), regenerated lazily
 
         self.search_query: str = ""
         self.search_page: int = 1
@@ -608,6 +951,7 @@ class YouTubePlayerApp(App):
         self._desired_position: float = 0.0
 
         self._active_download: Optional[DownloadHandle] = None
+        self._active_download_worker = None
 
         self._resume_path = os.path.join("data", "resume_state.json")
         self._load_and_prune_history()
@@ -625,6 +969,9 @@ class YouTubePlayerApp(App):
 
     def go_to_search(self) -> None:
         self.push_screen(SearchScreen())
+
+    def go_to_playlists(self) -> None:
+        self.push_screen(PlaylistsScreen())
 
     def play_history_entry(self, entry: dict) -> None:
         """Play a specific history entry (as shown by HistoryScreen). Takes
@@ -653,6 +1000,7 @@ class YouTubePlayerApp(App):
                 self.current_index = -1
                 self.current_title = title
                 self.current_youtube_url = url
+                self._queue_is_playlist = False
                 self._recovery_attempts = 0
                 self._desired_position = position
                 self._cleanup_active_download()
@@ -667,6 +1015,7 @@ class YouTubePlayerApp(App):
             self.current_index = 0
             self.current_title = title
             self.current_youtube_url = url
+            self._queue_is_playlist = False
             self._recovery_attempts = 0
             self._desired_position = position
             self.push_screen(PlayerScreen())
@@ -690,6 +1039,7 @@ class YouTubePlayerApp(App):
         self.current_index = 0
         self.current_title = title
         self.current_youtube_url = url
+        self._queue_is_playlist = False
         self._recovery_attempts = 0
         self._desired_position = 0.0
 
@@ -823,6 +1173,9 @@ class YouTubePlayerApp(App):
                     log.info("AFTER player.stop()")
 
                     log.info("BEFORE cleanup")
+                    if self._active_download_worker is not None:
+                        self._active_download_worker.cancel()
+                        self._active_download_worker = None
                     self._cleanup_active_download()
                     log.info("AFTER cleanup")
 
@@ -835,6 +1188,9 @@ class YouTubePlayerApp(App):
             return
 
         self.player.stop()
+        if self._active_download_worker is not None:
+            self._active_download_worker.cancel()
+            self._active_download_worker = None
         self._cleanup_active_download()
         self.exit()
 
@@ -850,9 +1206,11 @@ class YouTubePlayerApp(App):
         await self._ensure_search_cache(self.SEARCH_PAGE_SIZE)
         self.results = self._search_cache[: self.SEARCH_PAGE_SIZE]
         log.info("Search returned %d results, showing page 1", len(self.results))
+        _play_notification_sound()
         self.current_index = -1
         self.current_title = ""
         self.current_youtube_url = ""
+        self._queue_is_playlist = False
         self._recovery_attempts = 0
         # Track recent searches (max 10, deduplicate)
         if query in self.recent_searches:
@@ -879,6 +1237,7 @@ class YouTubePlayerApp(App):
         self.search_page = target_page
         self.results = self._search_cache[start:end]
         self.current_index = -1
+        _play_notification_sound()
         self._refresh_results_screen()
         self._prefetch_next_page()
 
@@ -956,16 +1315,42 @@ class YouTubePlayerApp(App):
         self._recovery_attempts = 0
         self._desired_position = 0.0
         log.info("PLAY_AT starting download/play task")
-        self._play_video_async(result.url, result.title)
+        self._play_video_async(result.url, result.title, resume=not self._queue_is_playlist)
         log.info("PLAY_AT pushing PlayerScreen")
         self.push_screen(PlayerScreen())
 
+    @staticmethod
+    def _buffer_wait_params(seek_to: float) -> tuple:
+        """min_bytes / timeout / stall_timeout for wait_for_file_growth().
+
+        min_bytes must scale with seek_to (need enough of the file on disk to
+        cover the resume timestamp) — that's a correctness requirement, not a
+        speed guess. timeout is just the startup grace period, kept flat: no
+        need to scale it, since stall_timeout is what actually bounds the
+        wait. stall_timeout scales instead, because a real download can go
+        quiet for tens of seconds (throttling, a slow patch of network) and
+        still be perfectly healthy — a hard deadline scaled to an optimistic
+        ~20x-realtime download speed killed downloads that were merely a bit
+        slower than that but still making steady progress (logged as
+        "PLAY_VIDEO_ASYNC timed out waiting for download to produce data"
+        while the same download quietly finished a few minutes later in the
+        background). Scaling patience instead of the deadline tolerates that
+        without waiting forever on a genuinely dead download.
+        """
+        min_bytes = 65536
+        buffer_timeout = 15.0
+        stall_timeout = 20.0
+        if seek_to > 0:
+            min_bytes = max(min_bytes, int(seek_to * 20000))  # ~160kbps conservative estimate
+            stall_timeout = max(stall_timeout, seek_to * 0.02)  # tolerate longer quiet patches on deep resumes
+        return min_bytes, buffer_timeout, stall_timeout
+
     @work
-    async def _play_video_async(self, url: str, title: str, seek_to: float = 0.0) -> None:
-        log.info("PLAY_VIDEO_ASYNC start: url=%s title=%s seek_to=%.1f", url, title, seek_to)
+    async def _play_video_async(self, url: str, title: str, seek_to: float = 0.0, resume: bool = True) -> None:
+        log.info("PLAY_VIDEO_ASYNC start: url=%s title=%s seek_to=%.1f resume=%s", url, title, seek_to, resume)
 
         # Resume from saved position if this video has a history entry.
-        if seek_to == 0.0:
+        if seek_to == 0.0 and resume:
             vid = _extract_video_id(url)
             if vid:
                 saved = self._lookup_history_position(vid)
@@ -973,6 +1358,18 @@ class YouTubePlayerApp(App):
                     seek_to = saved
                     self.notify(f"Resumed at {PlayerScreen._fmt(seek_to)}", timeout=3)
                     log.info("RESUME applied: %s at %.1fs", vid, seek_to)
+
+        # Cancel any previous _play_video_async worker still running (e.g.
+        # one still stuck in the buffer-wait for a track we've since
+        # switched away from, or quit out of) so it can't outlive us and
+        # fire a stale "timed out starting download" notification long
+        # after the user has already moved on — it was awaiting a file that
+        # _cleanup_active_download() below is about to delete out from
+        # under it anyway.
+        prev_worker = self._active_download_worker
+        self._active_download_worker = get_current_worker()
+        if prev_worker is not None and prev_worker is not self._active_download_worker:
+            prev_worker.cancel()
 
         # Clean up any previous download before starting a new one.
         self._cleanup_active_download()
@@ -1004,11 +1401,7 @@ class YouTubePlayerApp(App):
         # deep into a track, since mpv then seeks past the current EOF of the
         # still-growing file and reports a (false) normal end-of-file instead
         # of waiting, which used to get misread as the track finishing.
-        min_bytes = 65536
-        buffer_timeout = 15.0
-        if seek_to > 0:
-            min_bytes = max(min_bytes, int(seek_to * 20000))  # ~160kbps conservative estimate
-            buffer_timeout = max(buffer_timeout, seek_to * 0.05)  # assume >=20x realtime download speed
+        min_bytes, buffer_timeout, stall_timeout = self._buffer_wait_params(seek_to)
 
         if handle.is_cached:
             # Cached file is already complete — no need to wait for it to grow.
@@ -1018,10 +1411,12 @@ class YouTubePlayerApp(App):
             got_data = os.path.exists(handle.file_path)
         else:
             log.info(
-                "PLAY_VIDEO_ASYNC waiting for initial buffer (min_bytes=%d timeout=%.1f) at %s",
-                min_bytes, buffer_timeout, handle.file_path,
+                "PLAY_VIDEO_ASYNC waiting for initial buffer (min_bytes=%d timeout=%.1f stall_timeout=%.1f) at %s",
+                min_bytes, buffer_timeout, stall_timeout, handle.file_path,
             )
-            got_data = await wait_for_file_growth(handle.file_path, min_bytes=min_bytes, timeout=buffer_timeout)
+            got_data = await wait_for_file_growth(
+                handle.file_path, min_bytes=min_bytes, timeout=buffer_timeout, stall_timeout=stall_timeout
+            )
 
         if handle.error:
             log.error("PLAY_VIDEO_ASYNC download failed before playable: %s", handle.error)
@@ -1053,12 +1448,32 @@ class YouTubePlayerApp(App):
             log.error("PLAY_VIDEO_ASYNC background download ended with error: %s", handle.error)
 
     def _cleanup_active_download(self) -> None:
-        """Kill any in-progress download and remove its temp file."""
+        """Kill any in-progress download and remove its temp file.
+
+        A download that already finished successfully has its .done marker
+        written (see DownloadHandle.wait()) and is a valid cache entry — must
+        not delete that file, or every video ever played to completion (or
+        one whose background download simply raced ahead of playback and
+        finished) gets its cache silently destroyed on quit, forcing a full
+        re-download next time despite having a marker on disk.
+
+        Checked via the marker file itself, not handle.is_done/handle.error:
+        asyncio updates a subprocess's returncode (so is_done can go True)
+        the moment the OS process exits, independently of whether anyone
+        has awaited handle.wait() — and the marker is only written inside
+        wait(). If we bailed out of the buffer-wait early (timed out) without
+        ever reaching `await handle.wait()`, is_done/error reflect nothing
+        about how the download actually went; the marker is the only
+        trustworthy signal that it finished cleanly.
+        """
         handle = self._active_download
         self._active_download = None
         if not handle or handle.is_cached:
             return
         handle.kill()
+        if handle.video_id and os.path.exists(_marker_path(handle.video_id)):
+            log.info("CLEANUP keeping completed download (has .done marker): %s", handle.file_path)
+            return
         if not handle.file_path:
             return
         try:
@@ -1163,17 +1578,22 @@ class YouTubePlayerApp(App):
 
     def _advance_to_next(self) -> None:
         log.info(
-            "ADVANCE_TO_NEXT entered: current_index=%s results=%s current_screen=%s",
+            "ADVANCE_TO_NEXT entered: current_index=%s results=%s current_screen=%s repeat=%s",
             self.current_index,
             len(self.results),
             type(self.screen).__name__,
+            self.repeat_enabled,
         )
-        next_index = self.current_index + 1
+        if self.repeat_enabled:
+            log.info("ADVANCE_TO_NEXT repeat-one: replaying index=%s", self.current_index)
+            self.play_at(self.current_index)
+            return
+        next_index = self._resolve_step_index(1)
         log.info(
             "ADVANCE_TO_NEXT calculated next_index=%s",
             next_index,
         )
-        if 0 <= next_index < len(self.results):
+        if next_index is not None:
             log.info(
                 "ADVANCE_TO_NEXT playing next track index=%s",
                 next_index,
@@ -1186,6 +1606,9 @@ class YouTubePlayerApp(App):
             self.current_index = -1
             self.current_title = ""
             self.current_youtube_url = ""
+            if self._active_download_worker is not None:
+                self._active_download_worker.cancel()
+                self._active_download_worker = None
             self._cleanup_active_download()
             self.notify("Playback finished", timeout=2)
             if isinstance(self.screen, PlayerScreen):
@@ -1265,9 +1688,10 @@ class YouTubePlayerApp(App):
             log.warning("Next: no results loaded")
             self.notify("No results loaded", title="Next", timeout=1)
             return
-        if self.current_index < len(self.results) - 1:
+        next_index = self._resolve_step_index(1)
+        if next_index is not None:
             log.info("Next track from index %d", self.current_index)
-            self.play_at(self.current_index + 1)
+            self.play_at(next_index)
         else:
             log.info("Next: already at last track")
             self.notify("Already at last track", title="Next", timeout=1)
@@ -1277,12 +1701,136 @@ class YouTubePlayerApp(App):
             log.warning("Prev: no results loaded")
             self.notify("No results loaded", title="Prev", timeout=1)
             return
-        if self.current_index > 0:
+        prev_index = self._resolve_step_index(-1)
+        if prev_index is not None:
             log.info("Prev track from index %d", self.current_index)
-            self.play_at(self.current_index - 1)
+            self.play_at(prev_index)
         else:
             log.info("Prev: already at first track")
             self.notify("Already at first track", title="Prev", timeout=1)
+
+    # -- Repeat / Shuffle ---------------------------------------------------
+
+    def _resolve_step_index(self, direction: int) -> Optional[int]:
+        """Index for the next/prev track (direction=+1/-1), respecting
+        shuffle order. Never wraps the queue — repeat is single-track only
+        and doesn't affect manual/auto-advance navigation past the ends."""
+        n = len(self.results)
+        if n == 0:
+            return None
+        if self.shuffle_enabled:
+            if len(self._shuffle_order) != n:
+                self._regenerate_shuffle_order()
+            pos = self._shuffle_order.index(self.current_index) if self.current_index in self._shuffle_order else 0
+            pos += direction
+            if 0 <= pos < n:
+                return self._shuffle_order[pos]
+            return None
+        idx = self.current_index + direction
+        if 0 <= idx < n:
+            return idx
+        return None
+
+    def _regenerate_shuffle_order(self) -> None:
+        indices = list(range(len(self.results)))
+        random.shuffle(indices)
+        self._shuffle_order = indices
+
+    def action_toggle_repeat(self) -> None:
+        self.repeat_enabled = not self.repeat_enabled
+        self.notify(f"Repeat: {'on' if self.repeat_enabled else 'off'}", title="Repeat", timeout=1)
+        if isinstance(self.screen, PlayerScreen):
+            self.screen.update_modes(self.repeat_enabled, self.shuffle_enabled)
+
+    def action_toggle_shuffle(self) -> None:
+        self.shuffle_enabled = not self.shuffle_enabled
+        if self.shuffle_enabled:
+            self._regenerate_shuffle_order()
+        self.notify(f"Shuffle: {'on' if self.shuffle_enabled else 'off'}", title="Shuffle", timeout=1)
+        if isinstance(self.screen, PlayerScreen):
+            self.screen.update_modes(self.repeat_enabled, self.shuffle_enabled)
+
+    # -- Playlists ----------------------------------------------------------
+
+    def play_playlist(self, playlist_name: str, start_index: int = 0) -> None:
+        playlists = playlist.read_playlists()
+        pl = playlist.get_playlist(playlists, playlist_name)
+        if pl is None or not pl.videos:
+            self.notify("Playlist is empty", title="Playlist", severity="warning")
+            return
+        self.results = [
+            SearchResult(id=v.id, title=v.title, url=v.url, duration_str=v.duration_str, uploader=v.uploader)
+            for v in pl.videos
+        ]
+        self._shuffle_order = []
+        self._queue_is_playlist = True
+        self.play_at(start_index)
+
+    def action_add_to_playlist(self) -> None:
+        video = self._resolve_current_video_for_playlist()
+        if video is None:
+            self.notify("No video selected", title="Playlist", severity="warning")
+            return
+        names = playlist.list_playlist_names(playlist.read_playlists())
+        self.push_screen(AddToPlaylistModal(names), lambda name: self._on_playlist_chosen(name, video))
+
+    def _resolve_current_video_for_playlist(self) -> Optional[dict]:
+        """Video info to add via Ctrl+P, based on the currently visible
+        screen — PlayerScreen's now-playing video, or the highlighted item
+        in ResultsScreen/HistoryScreen. Returns a dict shaped like
+        PlaylistEntry (minus added_at), or None if nothing is selected."""
+        screen = self.screen
+        if isinstance(screen, PlayerScreen):
+            if not self.current_youtube_url:
+                return None
+            vid = _extract_video_id(self.current_youtube_url)
+            if 0 <= self.current_index < len(self.results) and self.results[self.current_index].url == self.current_youtube_url:
+                r = self.results[self.current_index]
+                return {"id": vid or r.id, "title": r.title, "url": r.url, "duration_str": r.duration_str, "uploader": r.uploader}
+            return {"id": vid or "", "title": self.current_title, "url": self.current_youtube_url, "duration_str": "", "uploader": ""}
+        if isinstance(screen, ResultsScreen):
+            index = screen.query_one("#results_list", OptionList).highlighted
+            if index is None or index >= len(self.results):
+                return None
+            r = self.results[index]
+            return {"id": r.id, "title": r.title, "url": r.url, "duration_str": r.duration_str, "uploader": r.uploader}
+        if isinstance(screen, HistoryScreen):
+            index = screen.query_one("#history_list", OptionList).highlighted
+            if index is None or index >= len(screen._entries):
+                return None
+            entry = screen._entries[index]
+            return {
+                "id": entry.get("video_id", ""),
+                "title": entry.get("title", "Unknown"),
+                "url": entry.get("url", ""),
+                "duration_str": format_duration(entry.get("duration", 0)),
+                "uploader": "",
+            }
+        return None
+
+    def _on_playlist_chosen(self, name: Optional[str], video: dict) -> None:
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        playlists = playlist.read_playlists()
+        existing = playlist.get_playlist(playlists, name)
+        created = existing is None
+        playlist.create_playlist(playlists, name)
+        entry = playlist.PlaylistEntry(
+            id=video["id"],
+            title=video["title"],
+            url=video["url"],
+            duration_str=video["duration_str"],
+            uploader=video["uploader"],
+            added_at=time.time(),
+        )
+        added = playlist.add_video_to_playlist(playlists, name, entry)
+        playlist.write_playlists(playlists)
+        if added:
+            suffix = " (new playlist)" if created else ""
+            self.notify(f"Added to '{name}'{suffix}", title="Playlist", timeout=2)
+        else:
+            self.notify(f"Already in '{name}'", title="Playlist", timeout=2)
 
 
 if __name__ == "__main__":

@@ -124,6 +124,16 @@ def _remove_partial(video_id: str) -> None:
             log.exception("CACHE failed to remove partial: %s", fpath)
 
 
+def format_duration(duration) -> str:
+    """Format a duration in seconds as H:MM:SS, or M:SS if under an hour."""
+    minutes, seconds = divmod(int(duration or 0), 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
 @dataclass
 class SearchResult:
     id: str
@@ -134,20 +144,11 @@ class SearchResult:
 
     @classmethod
     def from_dict(cls, data: dict) -> "SearchResult":
-        duration = data.get("duration", 0)
-        minutes, seconds = divmod(int(duration), 60)
-        hours, minutes = divmod(minutes, 60)
-
-        if hours > 0:
-            duration_str = f"{hours}:{minutes:02d}:{seconds:02d}"
-        else:
-            duration_str = f"{minutes}:{seconds:02d}"
-
         return cls(
             id=data.get("id", ""),
             title=data.get("title", "Unknown Title"),
             url=data.get("webpage_url", ""),
-            duration_str=duration_str,
+            duration_str=format_duration(data.get("duration", 0)),
             uploader=data.get("uploader", "Unknown Uploader"),
         )
 
@@ -517,22 +518,42 @@ async def start_audio_download(video_url: str) -> Tuple[Optional[DownloadHandle]
     return handle, None
 
 
-async def wait_for_file_growth(file_path: str, min_bytes: int = 65536, timeout: float = 15.0) -> bool:
-    """Poll until *file_path* exists and has at least *min_bytes*, or timeout.
+async def wait_for_file_growth(
+    file_path: str,
+    min_bytes: int = 65536,
+    timeout: float = 15.0,
+    stall_timeout: float = 20.0,
+) -> bool:
+    """Poll until *file_path* has at least *min_bytes*, or give up.
 
     Used to give the download a head start before handing the (still-growing)
     file to mpv, so playback doesn't immediately stall waiting on disk I/O
     that hasn't happened yet.
+
+    *timeout* is a soft deadline: once past it, this keeps polling as long as
+    the file is still actively growing, and only gives up after *stall_timeout*
+    seconds pass with no growth at all. Without this, a resume deep into a long
+    video (which raises min_bytes) combined with a slower-than-assumed but
+    perfectly healthy download gets killed by the timeout even though bytes
+    are still arriving — surfacing as "downloading" that never starts playing.
     """
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    last_size = -1
+    last_growth = time.monotonic()
+    while True:
         try:
-            if os.path.exists(file_path) and os.path.getsize(file_path) >= min_bytes:
-                return True
+            size = os.path.getsize(file_path) if os.path.exists(file_path) else -1
         except OSError:
-            pass
+            size = -1
+        if size >= min_bytes:
+            return True
+        now = time.monotonic()
+        if size > last_size:
+            last_size = size
+            last_growth = now
+        if now >= deadline and now - last_growth >= stall_timeout:
+            return False
         await asyncio.sleep(0.2)
-    return False
 
 
 async def fetch_video_title(url: str) -> str:

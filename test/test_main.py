@@ -17,7 +17,8 @@ try:
 except OSError:
     pytest.skip("mpv DLL not available — skipping main tests", allow_module_level=True)
 
-from main import PlayerScreen, SeekModal, YouTubePlayerApp  # noqa: E402
+from main import PlayerScreen, SeekModal, YouTubePlayerApp, _resolve_recent_ref, _play_notification_sound  # noqa: E402
+from search import DownloadHandle, SearchResult  # noqa: E402
 
 
 # ------------------------------------------------------------------
@@ -402,3 +403,400 @@ class TestSearchCachePagination:
             asyncio.run(app._ensure_search_cache(10))
         assert app._search_exhausted is True
         assert app._search_cache == []
+
+
+# ------------------------------------------------------------------
+# _cleanup_active_download
+# ------------------------------------------------------------------
+
+class TestCleanupActiveDownload:
+    """A completed download (.done marker actually on disk) must survive
+    quit — everything else (in progress, failed, or merely exited without
+    the marker having been written) should have its file removed."""
+
+    def _make_app(self):
+        return YouTubePlayerApp()
+
+    def _make_handle(self, tmp_path, monkeypatch, *, marker: bool, done: bool = False, error: str = None) -> DownloadHandle:
+        # _marker_path() (imported into main.py from search.py) resolves
+        # against search.DOWNLOAD_DIR at call time, so patching it there is
+        # enough regardless of the import path.
+        monkeypatch.setattr("search.DOWNLOAD_DIR", str(tmp_path))
+        file_path = str(tmp_path / "ytplay-abc123.webm")
+        with open(file_path, "wb") as f:
+            f.write(b"data")
+        if marker:
+            with open(str(tmp_path / "ytplay-abc123.done"), "w") as f:
+                f.write(file_path)
+        handle = DownloadHandle(None, file_path, "abc123", "abc123")
+        handle.file_path = file_path
+        handle._done = done
+        handle._error = error
+        return handle
+
+    def test_deletes_incomplete_download(self, tmp_path, monkeypatch):
+        app = self._make_app()
+        handle = self._make_handle(tmp_path, monkeypatch, marker=False, done=False)
+        app._active_download = handle
+        app._cleanup_active_download()
+        assert not os.path.exists(handle.file_path)
+
+    def test_keeps_download_with_done_marker(self, tmp_path, monkeypatch):
+        app = self._make_app()
+        handle = self._make_handle(tmp_path, monkeypatch, marker=True, done=True)
+        app._active_download = handle
+        app._cleanup_active_download()
+        assert os.path.exists(handle.file_path)
+
+    def test_deletes_download_that_finished_with_error_even_if_marker_missing(self, tmp_path, monkeypatch):
+        app = self._make_app()
+        handle = self._make_handle(tmp_path, monkeypatch, marker=False, done=True, error="yt-dlp exited with code 1")
+        app._active_download = handle
+        app._cleanup_active_download()
+        assert not os.path.exists(handle.file_path)
+
+    def test_deletes_download_marked_done_without_marker(self, tmp_path, monkeypatch):
+        # Regression: is_done can go True (asyncio observed the process exit)
+        # without handle.wait() ever running, e.g. because _play_video_async
+        # bailed out of the buffer-wait timeout first — so no marker was
+        # written. Must not be mistaken for a valid completed cache entry.
+        app = self._make_app()
+        handle = self._make_handle(tmp_path, monkeypatch, marker=False, done=True, error=None)
+        app._active_download = handle
+        app._cleanup_active_download()
+        assert not os.path.exists(handle.file_path)
+
+
+# ------------------------------------------------------------------
+# YouTubePlayerApp._buffer_wait_params
+# ------------------------------------------------------------------
+
+class TestBufferWaitParams:
+    def test_fresh_start_uses_flat_defaults(self):
+        min_bytes, timeout, stall_timeout = YouTubePlayerApp._buffer_wait_params(0.0)
+        assert min_bytes == 65536
+        assert timeout == 15.0
+        assert stall_timeout == 20.0
+
+    def test_deep_resume_scales_min_bytes_and_stall_timeout_not_timeout(self):
+        min_bytes, timeout, stall_timeout = YouTubePlayerApp._buffer_wait_params(4068.6)
+        assert min_bytes == int(4068.6 * 20000)
+        # The startup grace period stays flat — only patience for a quiet
+        # download scales with how deep the resume is, so a healthy-but-slow
+        # download isn't killed by a deadline sized for an optimistic speed.
+        assert timeout == 15.0
+        assert stall_timeout == pytest.approx(4068.6 * 0.02)
+
+    def test_small_seek_still_floors_at_defaults(self):
+        min_bytes, timeout, stall_timeout = YouTubePlayerApp._buffer_wait_params(1.0)
+        assert min_bytes == 65536  # 20000 bytes < floor
+        assert stall_timeout == 20.0  # 0.02s scaled < floor
+
+
+# ------------------------------------------------------------------
+# _active_download_worker cancellation
+# ------------------------------------------------------------------
+
+class TestActiveDownloadWorkerCancellation:
+    """A previous _play_video_async worker must not outlive a track switch
+    or quit — otherwise it keeps awaiting a file _cleanup_active_download()
+    has already deleted, and eventually fires a stale "timed out starting
+    download" notification long after the user moved on (observed in
+    log/yt-play-20260915-181437-13688.log: quit at 18:15:57, stale timeout
+    error logged at 18:16:09 — 12s after the app had already returned to
+    the menu)."""
+
+    @staticmethod
+    async def _hang_forever(*args, **kwargs):
+        await asyncio.sleep(999)
+        return None, None  # pragma: no cover - never reached
+
+    def test_starting_new_track_cancels_previous_worker(self):
+        async def scenario():
+            app = YouTubePlayerApp()
+            with patch("main.start_audio_download", AsyncMock(side_effect=self._hang_forever)):
+                async with app.run_test() as pilot:
+                    worker1 = app._play_video_async("https://www.youtube.com/watch?v=aaaaaaaaaaa", "A")
+                    await pilot.pause()
+                    assert app._active_download_worker is worker1
+                    assert not worker1.is_cancelled
+
+                    worker2 = app._play_video_async("https://www.youtube.com/watch?v=bbbbbbbbbbb", "B")
+                    await pilot.pause()
+
+                    assert worker1.is_cancelled
+                    assert app._active_download_worker is worker2
+
+        asyncio.run(scenario())
+
+    def test_quit_cancels_active_worker(self):
+        async def scenario():
+            app = YouTubePlayerApp()
+            with patch("main.start_audio_download", AsyncMock(side_effect=self._hang_forever)):
+                async with app.run_test() as pilot:
+                    worker = app._play_video_async("https://www.youtube.com/watch?v=aaaaaaaaaaa", "A")
+                    await pilot.pause()
+                    assert app._active_download_worker is worker
+
+                    # Screen is MenuScreen (not PlayerScreen), so action_quit
+                    # takes the direct-exit branch — the same one that must
+                    # cancel a still-running download worker before exiting.
+                    app.action_quit()
+                    await pilot.pause()
+
+                    assert worker.is_cancelled
+                    assert app._active_download_worker is None
+
+        asyncio.run(scenario())
+
+
+async def _hang_forever(*args, **kwargs):
+    await asyncio.sleep(999)
+    return None, None  # pragma: no cover - never reached
+
+
+# ------------------------------------------------------------------
+# _resolve_step_index — next/prev routing, in-order and shuffled
+# ------------------------------------------------------------------
+
+class TestResolveStepIndex:
+    """Pure attribute manipulation — no download/mpv needed, matches
+    TestBufferWaitParams' no-harness style."""
+
+    def _make_app(self, n, current_index=0, shuffle=False):
+        app = YouTubePlayerApp()
+        app.results = [object() for _ in range(n)]
+        app.current_index = current_index
+        app.shuffle_enabled = shuffle
+        return app
+
+    def test_empty_queue_returns_none(self):
+        app = self._make_app(0)
+        assert app._resolve_step_index(1) is None
+
+    def test_next_in_order(self):
+        app = self._make_app(3, current_index=0)
+        assert app._resolve_step_index(1) == 1
+
+    def test_next_at_end_returns_none(self):
+        app = self._make_app(3, current_index=2)
+        assert app._resolve_step_index(1) is None
+
+    def test_prev_in_order(self):
+        app = self._make_app(3, current_index=2)
+        assert app._resolve_step_index(-1) == 1
+
+    def test_prev_at_start_returns_none(self):
+        app = self._make_app(3, current_index=0)
+        assert app._resolve_step_index(-1) is None
+
+    def test_shuffle_next_follows_shuffle_order_not_index_order(self):
+        app = self._make_app(4, current_index=0, shuffle=True)
+        app._shuffle_order = [2, 0, 3, 1]  # current_index 0 sits at position 1
+        assert app._resolve_step_index(1) == 3  # next position (2) holds index 3
+
+    def test_shuffle_prev_follows_shuffle_order(self):
+        app = self._make_app(4, current_index=0, shuffle=True)
+        app._shuffle_order = [2, 0, 3, 1]
+        assert app._resolve_step_index(-1) == 2  # previous position (0) holds index 2
+
+    def test_shuffle_at_end_of_order_returns_none(self):
+        app = self._make_app(3, current_index=0, shuffle=True)
+        app._shuffle_order = [1, 2, 0]  # current_index 0 is last in shuffle order
+        assert app._resolve_step_index(1) is None
+
+    def test_shuffle_regenerates_stale_order(self):
+        app = self._make_app(3, current_index=0, shuffle=True)
+        app._shuffle_order = [0, 1]  # stale — was built for a 2-item queue
+        result = app._resolve_step_index(1)
+        assert len(app._shuffle_order) == 3
+        assert sorted(app._shuffle_order) == [0, 1, 2]
+        # current_index (0) may land anywhere in the freshly regenerated
+        # order, including last — a valid next-index or None either way.
+        assert result is None or result in (0, 1, 2)
+
+
+# ------------------------------------------------------------------
+# Repeat / shuffle toggles and repeat-one auto-advance
+# ------------------------------------------------------------------
+
+class TestRepeatShuffleToggle:
+    def test_toggle_repeat_flips_state(self):
+        async def scenario():
+            app = YouTubePlayerApp()
+            async with app.run_test() as pilot:
+                assert app.repeat_enabled is False
+                app.action_toggle_repeat()
+                await pilot.pause()
+                assert app.repeat_enabled is True
+                app.action_toggle_repeat()
+                await pilot.pause()
+                assert app.repeat_enabled is False
+
+        asyncio.run(scenario())
+
+    def test_toggle_shuffle_regenerates_order(self):
+        async def scenario():
+            app = YouTubePlayerApp()
+            app.results = [object(), object(), object()]
+            async with app.run_test() as pilot:
+                assert app.shuffle_enabled is False
+                app.action_toggle_shuffle()
+                await pilot.pause()
+                assert app.shuffle_enabled is True
+                assert sorted(app._shuffle_order) == [0, 1, 2]
+
+        asyncio.run(scenario())
+
+
+class TestAdvanceToNextRepeat:
+    """Repeat is single-track only: it replays the current track on a
+    natural end, but never wraps the whole queue — that's still N/P's
+    normal clamp-at-the-edges behavior."""
+
+    def test_repeat_enabled_replays_current_track_not_next(self):
+        async def scenario():
+            app = YouTubePlayerApp()
+            app.results = [
+                SearchResult(id="a", title="A", url="https://www.youtube.com/watch?v=aaaaaaaaaaa", duration_str="1:00", uploader="U"),
+                SearchResult(id="b", title="B", url="https://www.youtube.com/watch?v=bbbbbbbbbbb", duration_str="1:00", uploader="U"),
+            ]
+            app.current_index = 0
+            app.repeat_enabled = True
+            with patch("main.start_audio_download", AsyncMock(side_effect=_hang_forever)):
+                async with app.run_test() as pilot:
+                    app._advance_to_next()
+                    await pilot.pause()
+                    assert app.current_index == 0
+                    assert app.current_title == "A"
+
+        asyncio.run(scenario())
+
+    def test_repeat_disabled_advances_normally(self):
+        async def scenario():
+            app = YouTubePlayerApp()
+            app.results = [
+                SearchResult(id="a", title="A", url="https://www.youtube.com/watch?v=aaaaaaaaaaa", duration_str="1:00", uploader="U"),
+                SearchResult(id="b", title="B", url="https://www.youtube.com/watch?v=bbbbbbbbbbb", duration_str="1:00", uploader="U"),
+            ]
+            app.current_index = 0
+            app.repeat_enabled = False
+            with patch("main.start_audio_download", AsyncMock(side_effect=_hang_forever)):
+                async with app.run_test() as pilot:
+                    app._advance_to_next()
+                    await pilot.pause()
+                    assert app.current_index == 1
+                    assert app.current_title == "B"
+
+        asyncio.run(scenario())
+
+
+# ------------------------------------------------------------------
+# Playlist playback starts every track at 0:00 — never resumes
+# ------------------------------------------------------------------
+
+class TestPlaylistNoResume:
+    def _make_app(self, tmp_path):
+        app = YouTubePlayerApp()
+        setattr(app, "_resume_path", str(tmp_path / "resume_state.json"))
+        return app
+
+    def test_playlist_queue_suppresses_resume(self, tmp_path):
+        async def scenario():
+            app = self._make_app(tmp_path)
+            app._write_history([
+                {"video_id": "aaaaaaaaaaa", "title": "A", "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa", "position": 42.0, "duration": 100.0},
+            ])
+            app.results = [SearchResult(id="aaaaaaaaaaa", title="A", url="https://www.youtube.com/watch?v=aaaaaaaaaaa", duration_str="1:40", uploader="U")]
+            app._queue_is_playlist = True
+            async with app.run_test() as pilot:
+                with patch.object(app, "_play_video_async") as mock_play:
+                    app.play_at(0)
+                    await pilot.pause()
+                assert mock_play.call_args.kwargs.get("resume") is False
+
+        asyncio.run(scenario())
+
+    def test_search_queue_still_resumes(self, tmp_path):
+        async def scenario():
+            app = self._make_app(tmp_path)
+            app._write_history([
+                {"video_id": "aaaaaaaaaaa", "title": "A", "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa", "position": 42.0, "duration": 100.0},
+            ])
+            app.results = [SearchResult(id="aaaaaaaaaaa", title="A", url="https://www.youtube.com/watch?v=aaaaaaaaaaa", duration_str="1:40", uploader="U")]
+            app._queue_is_playlist = False
+            async with app.run_test() as pilot:
+                with patch.object(app, "_play_video_async") as mock_play:
+                    app.play_at(0)
+                    await pilot.pause()
+                assert mock_play.call_args.kwargs.get("resume") is True
+
+        asyncio.run(scenario())
+
+
+# ------------------------------------------------------------------
+# play_playlist
+# ------------------------------------------------------------------
+
+class TestPlayPlaylist:
+    def test_empty_playlist_notifies_and_does_not_play(self, tmp_path, monkeypatch):
+        import playlist as playlist_module
+
+        async def scenario():
+            monkeypatch.setattr(playlist_module, "PLAYLISTS_PATH", str(tmp_path / "playlists.json"))
+            playlist_module.write_playlists([playlist_module.create_playlist([], "Empty")])
+            app = YouTubePlayerApp()
+            async with app.run_test() as pilot:
+                with patch.object(app, "_play_video_async") as mock_play:
+                    app.play_playlist("Empty")
+                    await pilot.pause()
+                mock_play.assert_not_called()
+
+        asyncio.run(scenario())
+
+    def test_play_playlist_loads_videos_into_results_and_marks_queue(self, tmp_path, monkeypatch):
+        import playlist as playlist_module
+
+        async def scenario():
+            monkeypatch.setattr(playlist_module, "PLAYLISTS_PATH", str(tmp_path / "playlists.json"))
+            playlists = [playlist_module.create_playlist([], "Mix")]
+            playlist_module.add_video_to_playlist(
+                playlists, "Mix",
+                playlist_module.PlaylistEntry(id="aaaaaaaaaaa", title="A", url="https://www.youtube.com/watch?v=aaaaaaaaaaa", duration_str="1:00", uploader="U", added_at=0.0),
+            )
+            playlist_module.write_playlists(playlists)
+            app = YouTubePlayerApp()
+            with patch("main.start_audio_download", AsyncMock(side_effect=_hang_forever)):
+                async with app.run_test() as pilot:
+                    app.play_playlist("Mix")
+                    await pilot.pause()
+                    assert app._queue_is_playlist is True
+                    assert len(app.results) == 1
+                    assert app.results[0].id == "aaaaaaaaaaa"
+                    assert app.current_title == "A"
+
+        asyncio.run(scenario())
+
+
+class TestRecentRef:
+    """$N tokens in the search box resolve against recent_searches."""
+
+    def test_resolves_index(self):
+        recent = ["newest", "middle", "oldest"]
+        assert _resolve_recent_ref("$0", recent) == "newest"
+        assert _resolve_recent_ref("$2", recent) == "oldest"
+
+    def test_out_of_range(self):
+        assert _resolve_recent_ref("$3", ["a", "b", "c"]) is None
+        assert _resolve_recent_ref("$0", []) is None
+
+    def test_not_a_token(self):
+        assert _resolve_recent_ref("$", ["a"]) is None
+        assert _resolve_recent_ref("$x", ["a"]) is None
+        assert _resolve_recent_ref("hello", ["a"]) is None
+        assert _resolve_recent_ref("$-1", ["a"]) is None
+
+
+def test_notification_sound_never_raises():
+    with patch("winsound.MessageBeep", side_effect=RuntimeError("boom"), create=True):
+        _play_notification_sound()

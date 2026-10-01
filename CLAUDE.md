@@ -18,6 +18,8 @@ Terminal-based YouTube audio player. `yt-dlp` for search/stream extraction, `lib
 uv sync                        # install deps
 uv sync --dev                  # install + dev deps (pytest)
 uv run main.py                 # run the app
+uv run main.py -h              # CLI help (--version too)
+uv run upgrade_ytdlp.py         # upgrade yt-dlp (YouTube extraction breaks often)
 uv run pytest -v                        # all tests
 uv run pytest test/test_search.py -v    # one test file
 uv run pytest -k "extract_video_id"     # by keyword
@@ -44,7 +46,7 @@ Before every commit: run `uv run pytest -v`. If the change adds/alters behavior 
 All screen/modal classes live in `main.py` (no separate widgets module):
 - **MenuScreen** — entry point, three options: Play History / Search / Play from URL.
 - **HistoryScreen** — lists play history newest-first (list is reversed for display; index math un-reverses on selection). Selecting plays the entry, downloading if not cached.
-- **SearchScreen** — `Input.Submitted` → `app.do_search()`. `$0` repeats the last search and auto-plays the first result. Shows a "Recent:" list backed by `recent_searches` (max 10, deduplicated, newest-first).
+- **SearchScreen** — `Input.Submitted` → `app.do_search()`. `$N` (`_resolve_recent_ref`) repeats `recent_searches[N]` and auto-plays the first result (`$0` = newest). Shows a numbered "Recent:" list (`$0  query`) backed by `recent_searches` (max 10, deduplicated, newest-first). `_play_notification_sound()` (three-note winsound chime on a daemon thread, `` fallback) fires when a search or next-page fetch lands.
 - **ResultsScreen** — `OptionList` of results; selection calls `app.play_at(index)`.
 - **PlayerScreen** — now-playing title, progress bar, live updates from player callbacks.
 - **QuitScreen** — `ModalScreen[bool]`, Y/N/Esc confirmation on `Ctrl+D`.
@@ -56,6 +58,7 @@ All app state and logic lives on `YouTubePlayerApp`; screens stay thin (UI + cal
 `@work` decorators mark async methods that dispatch background jobs and return `Worker` objects — never `await` them:
 - `do_search` uses `exclusive=True` (concurrent searches are wasteful).
 - `_play_video_async` intentionally does **not** use `exclusive=True`, so N/P (next/prev) works — the previous download is cancelled explicitly via `_cleanup_active_download()` inside the method, not by worker exclusivity.
+- `self._active_download_worker` tracks the `Worker` object of the currently-running `_play_video_async` call. Track-switch (`_play_video_async`'s own first lines, via `get_current_worker()`), quit (`action_quit`, both branches), and queue-exhausted (`_advance_to_next`) all explicitly `.cancel()` the *previous* worker before moving on. Without this, an old worker left running the buffer-wait loop in `wait_for_file_growth()` keeps polling a file `_cleanup_active_download()` has already deleted out from under it, and only reports its own `PLAY_VIDEO_ASYNC timed out waiting for download to produce data` (with a stale "Timed out starting download" notify toast) once `stall_timeout` elapses — up to a minute or more after the user already quit or switched tracks, surfacing as a confusing error notification with no apparent cause.
 - Callbacks fired from the player's own thread (`on_time_update`, `on_error`, `on_end`) must cross back via `self.call_from_thread(...)` before touching any widget.
 
 ### Download-to-disk-and-play (`search.py`)
@@ -67,6 +70,7 @@ Streaming directly from YouTube's CDN URL works for in-order playback but seekin
 - Files named `ytplay-{video_id}.{ext}` in `data/`; a `.done` marker file marks a completed download.
 - `start_audio_download()`: cache hit (marker + file both exist) → return handle with `is_cached=True`, no subprocess. Partial download (file present, no marker) → deleted and re-downloaded.
 - `_cleanup_cache()` runs before every new download: removes orphan `.done` markers, files not referenced by any resume-history `video_id`, and history-referenced files older than `CacheConfig.max_cache_age_hours` (7 days).
+- `YouTubePlayerApp._cleanup_active_download()` (`main.py`) — called on quit and on switching tracks — must check whether `handle.video_id`'s `.done` marker actually exists on disk before deleting the file: a download that finished successfully has that marker written (by `DownloadHandle.wait()`), so deleting the file anyway (while leaving the marker) creates exactly the orphan-marker case `_cleanup_cache()` cleans up next launch, and defeats caching for any video that was ever played to completion. Deliberately does **not** trust `handle.is_done`/`handle.error` for this: asyncio flips a subprocess's returncode (so `is_done` goes `True`) the moment the OS process exits, independent of whether anyone ever awaited `handle.wait()` — if `_play_video_async` gave up on the buffer-wait timeout before reaching that await, `is_done` can be `True` with `error` still `None` even though nothing about the download's outcome is actually known. The `.done` marker is the only ground truth.
 - `DownloadHandle.kill()` closes stdout/stderr and calls `p.wait()` after killing — needed to avoid `ValueError: I/O operation on closed pipe` on Windows (Python 3.14+ raises if a pipe fileno is touched after close).
 - `extract_audio_url` / `fetch_video_title` return errors as tuples/fallback strings rather than raising — callers must handle the failure value, not assume success.
 - The output path is resolved **event-driven, not by polling**: yt-dlp's stdout is watched for the `[download] Destination: ...` line as soon as it's printed, instead of stat'ing the download directory every 100ms for a matching filename. `DownloadHandle.wait()` streams stderr incrementally rather than buffering it all via `process.communicate()`.
@@ -99,11 +103,26 @@ Position is saved to `data/resume_state.json` as a list of per-video entries (ke
 
 `_handle_track_end` distinguishes a genuine end-of-track from a false EOF: if mpv reports a normal end (`error_msg is None`) but the backing `DownloadHandle` isn't done yet, that's treated as recoverable (the file just hasn't grown far enough) rather than "queue advance." Real errors and this false-EOF case both go through `_attempt_recovery()`, which re-extracts/restarts the download and resumes at `max(player.current_time, self._desired_position)`, capped at `MAX_RECOVERY_ATTEMPTS` (3).
 
-`_play_video_async` also scales how much it waits for the file to buffer before starting playback when resuming mid-video (`seek_to > 0`): `min_bytes = max(65536, seek_to * 20000)` and `buffer_timeout = max(15.0, seek_to * 0.05)`, a conservative ~160kbps bitrate estimate — reduces the odds of the false-EOF case above triggering right after a resume seek.
+`_play_video_async` also scales how much it waits for the file to buffer before starting playback when resuming mid-video (`seek_to > 0`), via `YouTubePlayerApp._buffer_wait_params(seek_to)`: `min_bytes = max(65536, seek_to * 20000)` (~160kbps conservative estimate of how many bytes must be on disk to cover the resume point — a correctness requirement, not a speed guess) and `stall_timeout = max(20.0, seek_to * 0.02)`. `buffer_timeout` itself stays flat at 15.0 regardless of `seek_to` — it's just the startup grace period.
+
+- `wait_for_file_growth()` (`search.py`) treats `buffer_timeout` as a *soft* deadline, not a hard one: once past it, polling continues as long as the file is still actively growing, only giving up after `stall_timeout` passes with zero growth. Patience (`stall_timeout`), not the deadline, is what scales with `seek_to` — a real download can go quiet for tens of seconds under throttling and still be perfectly healthy. An earlier version scaled `buffer_timeout` itself (assuming ≥20x-realtime download speed) instead of `stall_timeout`; that killed downloads that were merely a bit slower than that optimistic assumption but still making steady progress — symptom: the player shows "downloading" and then just stops, never starting playback (`PLAY_VIDEO_ASYNC timed out waiting for download to produce data` in the log), while the same download quietly finished a few minutes later in the background (confirmed via repro logs: the file kept growing past the old deadline, and a `.done` marker existed on the *next* launch for a file the app itself had already deleted).
 
 ### Config (`config.py`)
 
 Single `CONFIG` singleton (`CacheConfig` dataclass) — `cache_dir`, `max_cache_age_hours`, `resume_max_age_days`, `log_max_age_days`, `log_max_count` (the latter two used by log retention, see Logging below). Import as `from config import CONFIG`; don't hardcode cache paths elsewhere.
+
+### Playlists (`playlist.py`)
+
+Named playlists of videos, persisted to `data/playlists.json` — `PlaylistEntry` (`id, title, url, duration_str, uploader, added_at`) mirrors `search.SearchResult` (minus `added_at`) so a playlist's videos can be loaded straight into `SearchResult` objects. `Playlist` is `name, created_at, videos: list[PlaylistEntry]`.
+
+- Stateless on disk, same pattern as history: `read_playlists()`/`write_playlists()` read-fresh/write-back; no in-app cache. `create_playlist`/`add_video_to_playlist`/`remove_video_from_playlist`/`delete_playlist` all mutate the list/`Playlist` passed in — callers `read_playlists()`, mutate, `write_playlists()`.
+- **Video de-dup is per-playlist, not global** — `add_video_to_playlist` only scans the target playlist's own videos, so the same video can belong to any number of different playlists; it's only rejected as a duplicate within the *same* playlist.
+- **Playlist playback reuses the existing search-results queue** (`YouTubePlayerApp.results`/`current_index`, driving `play_at`/`_advance_to_next`/`action_next_track`/`action_prev_track`) rather than a separate queue type — `play_playlist(name, start_index)` just loads the playlist's videos as `SearchResult`s into `self.results` and calls `play_at`. `self._queue_is_playlist` tracks which source populated `self.results` (playlist vs search/history/URL, reset to `False` at the start of `do_search`/`play_history_entry`/`_play_url_entry`).
+- **Playlist tracks always start at 0:00 — never resume**: `_play_video_async` takes a `resume: bool` param gating the history-position lookup; `play_at` passes `resume=not self._queue_is_playlist`. Playing a video from search/history still resumes as before; playing it from inside a playlist is an explicit "from the top" action and skips the lookup even if that video has a saved position.
+- **Repeat is single-track only**, not a whole-queue/whole-playlist wraparound: `YouTubePlayerApp.repeat_enabled` (toggled by `r`) makes `_advance_to_next()` replay `self.current_index` on a natural end instead of advancing. It never changes what `N`/`P` or a queue-exhausted stop do — a manual skip always moves to a different track regardless of `repeat_enabled`.
+- **Shuffle** (`shuffle_enabled`, toggled by `s`) changes what "next"/"prev" *means* — `_resolve_step_index(direction)` is the single routing helper shared by manual `N`/`P` and auto-advance's non-repeat path: in-order by default, or stepping through `self._shuffle_order` (a permutation of `range(len(self.results))`, regenerated lazily whenever its length no longer matches `self.results`) when shuffle is on. Applies to whatever queue is currently loaded — search results or a playlist — since both are just `self.results`.
+- `Ctrl+P` (`action_add_to_playlist`) opens `AddToPlaylistModal` to add the current/highlighted video to an existing or brand-new playlist, from `PlayerScreen` (now-playing), `ResultsScreen`, or `HistoryScreen` (highlighted `OptionList` item in the latter two — read via `.highlighted`, same "don't wait for Enter" approach `HistoryScreen._delete_selected` uses). `_resolve_current_video_for_playlist()` does the per-screen resolution.
+- Main menu → `PlaylistsScreen` (browse/create/delete playlists) → `PlaylistDetailScreen` (browse videos in one playlist, play from a selected video, remove a video). Both follow `HistoryScreen`'s list/populate/`on_key`/`QuitScreen`-confirm shape.
 
 ## Windows-specific notes
 

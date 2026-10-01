@@ -16,6 +16,7 @@ from search import (
     _remove_partial,
     search_youtube,
     SearchResult,
+    wait_for_file_growth,
 )
 from config import CONFIG
 
@@ -273,3 +274,55 @@ class TestCleanupCache:
         monkeypatch.setattr("search.DOWNLOAD_DIR", "/nonexistent/path/xyz789")
         # Should not raise
         _cleanup_cache()
+
+
+# ---------------------------------------------------------------------------
+# wait_for_file_growth
+# ---------------------------------------------------------------------------
+
+class TestWaitForFileGrowth:
+    def test_returns_true_once_min_bytes_reached(self, tmp_path):
+        path = str(tmp_path / "f.bin")
+        with open(path, "wb") as f:
+            f.write(b"x" * 100)
+        result = asyncio.run(wait_for_file_growth(path, min_bytes=50, timeout=1.0))
+        assert result is True
+
+    def test_returns_false_when_file_never_appears(self, tmp_path):
+        path = str(tmp_path / "missing.bin")
+        result = asyncio.run(
+            wait_for_file_growth(path, min_bytes=50, timeout=0.2, stall_timeout=0.2)
+        )
+        assert result is False
+
+    def test_survives_slow_but_steady_growth_past_soft_timeout(self, tmp_path):
+        # Regression: a download that hasn't reached min_bytes by the soft
+        # `timeout` but is still actively growing must not be killed — only a
+        # genuine stall (no growth for stall_timeout) should fail it.
+        path = str(tmp_path / "growing.bin")
+
+        async def trickle():
+            for _ in range(6):
+                await asyncio.sleep(0.1)
+                with open(path, "ab") as f:
+                    f.write(b"x" * 20)
+
+        async def run():
+            writer = asyncio.ensure_future(trickle())
+            try:
+                return await wait_for_file_growth(
+                    path, min_bytes=100, timeout=0.15, stall_timeout=0.5
+                )
+            finally:
+                await writer
+
+        assert asyncio.run(run()) is True
+
+    def test_fails_after_stall_timeout_with_no_growth(self, tmp_path):
+        path = str(tmp_path / "stalled.bin")
+        with open(path, "wb") as f:
+            f.write(b"x" * 10)  # below min_bytes, and never grows further
+        result = asyncio.run(
+            wait_for_file_growth(path, min_bytes=1000, timeout=0.1, stall_timeout=0.2)
+        )
+        assert result is False
