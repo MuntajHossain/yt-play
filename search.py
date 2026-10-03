@@ -247,8 +247,8 @@ async def fetch_channel_videos(channel_name: str, max_results: int = 50) -> List
 
     results: List[SearchResult] = []
     if not stdout:
-        err = stderr.decode("utf-8", errors="replace")[:200] if stderr else ""
-        log.warning("CHANNEL fetch failed for @%s: %s", channel_name, err)
+        err = stderr.decode("utf-8", errors="replace") if stderr else ""
+        log.error("CHANNEL fetch failed for @%s: %s", channel_name, err[:500])
         return results
 
     for line in stdout.decode("utf-8").strip().split("\n"):

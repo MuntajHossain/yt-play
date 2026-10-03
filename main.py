@@ -1237,28 +1237,28 @@ class YouTubePlayerApp(App):
 
     @work(exclusive=True)
     async def do_search_channel(self, channel_name: str) -> None:
-        log.info("Loading channel: @%s", channel_name)
+        log.info("CHANNEL start loading: @%s", channel_name)
         self.search_query = f"@{channel_name}"
         self.search_page = 1
         self._search_cache = []
         self._search_exhausted = False
         try:
             batch = await fetch_channel_videos(channel_name, max_results=100)
+            if not batch:
+                log.warning("CHANNEL @%s returned no results", channel_name)
+                self.notify(f"Channel @{channel_name} not found or has no videos", timeout=4)
+                self.call_from_thread(self.pop_screen)
+                return
             self._search_cache.extend(batch)
             self._search_exhausted = True
-        except Exception:
-            log.exception("Failed to fetch channel videos for @%s", channel_name)
-            self.notify("Failed to load channel", timeout=3)
+        except Exception as e:
+            log.exception("CHANNEL fetch failed for @%s: %s", channel_name, str(e))
+            self.notify(f"Failed to load channel @{channel_name}", timeout=3)
             self.call_from_thread(self.pop_screen)
             return
 
         self.results = self._search_cache[: self.SEARCH_PAGE_SIZE]
-        log.info("Channel @%s returned %d videos", channel_name, len(self.results))
-        if not self.results:
-            self.notify("Channel has no videos", timeout=3)
-            self.call_from_thread(self.pop_screen)
-            return
-
+        log.info("CHANNEL @%s loaded %d videos", channel_name, len(self.results))
         _play_notification_sound()
         self.current_index = -1
         self.current_title = ""
