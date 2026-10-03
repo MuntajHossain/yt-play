@@ -10,6 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+from urllib.parse import quote_plus
 
 from config import CONFIG
 
@@ -229,38 +230,76 @@ async def search_youtube(
     return results
 
 
-async def fetch_channel_videos(channel_name: str, max_results: int = 50) -> List[SearchResult]:
-    """Fetch all (or up to max_results) videos from a YouTube channel.
-
-    Takes a channel name (e.g., 'yt-play-channel') and constructs the channel URL,
-    then extracts videos via yt-dlp. Returns list of SearchResult objects.
-    """
-    channel_url = f"https://www.youtube.com/@{channel_name}/videos"
-    stdout, stderr = await _run_ytdlp(
-        "--dump-json",
-        "--no-warnings",
-        "--ignore-errors",
-        "--playlist-start", "1",
-        "--playlist-end", str(max_results),
-        channel_url,
-    )
-
-    results: List[SearchResult] = []
-    if not stdout:
-        err = stderr.decode("utf-8", errors="replace") if stderr else ""
-        log.error("CHANNEL fetch failed for @%s: %s", channel_name, err[:500])
-        return results
-
-    for line in stdout.decode("utf-8").strip().split("\n"):
+def _parse_json_lines(stdout: bytes) -> List[dict]:
+    rows: List[dict] = []
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            data = json.loads(line)
-            results.append(SearchResult.from_dict(data))
+            rows.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+    return rows
 
+
+async def resolve_channel(name: str) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve a channel handle or display name to ``(channel_url, channel_title)``.
+
+    "@handle" style names (no spaces) are tried directly; anything else, or a
+    handle that 404s, falls back to YouTube's channel-filtered search and takes
+    the top hit - display names like "Mir Afsar Ali" are not valid handles.
+    """
+    name = name.strip()
+    if name and not any(c.isspace() for c in name):
+        stdout, _ = await _run_ytdlp(
+            "--flat-playlist", "--dump-single-json", "--playlist-end", "1",
+            "--no-warnings", f"https://www.youtube.com/@{name}/videos",
+        )
+        if stdout:
+            try:
+                info = json.loads(stdout.decode("utf-8", errors="replace"))
+                url = info.get("channel_url") or info.get("uploader_url")
+                if url:
+                    return url, info.get("channel") or info.get("uploader") or name
+            except json.JSONDecodeError:
+                pass
+
+    stdout, stderr = await _run_ytdlp(
+        "--flat-playlist", "--dump-json", "--playlist-end", "1", "--no-warnings",
+        f"https://www.youtube.com/results?search_query={quote_plus(name)}&sp=EgIQAg%3D%3D",
+    )
+    for row in _parse_json_lines(stdout):
+        url = row.get("channel_url") or row.get("url")
+        if url:
+            return url, row.get("channel") or row.get("title") or name
+    log.error("CHANNEL resolve failed for %r: %s", name, stderr.decode("utf-8", errors="replace")[:300])
+    return None, None
+
+
+async def fetch_channel_videos(channel_name: str, max_results: int = 50) -> List[SearchResult]:
+    """Fetch up to *max_results* newest videos from a channel (handle or display name).
+
+    Uses a flat listing (no per-video extraction), so it returns in about a
+    second instead of ~3s per video. Returns [] if the channel can't be
+    resolved or has no videos.
+    """
+    channel_url, channel_title = await resolve_channel(channel_name)
+    if not channel_url:
+        return []
+
+    stdout, stderr = await _run_ytdlp(
+        "--flat-playlist", "--dump-json", "--no-warnings", "--ignore-errors",
+        "--playlist-end", str(max_results),
+        channel_url.rstrip("/") + "/videos",
+    )
+    results: List[SearchResult] = []
+    for data in _parse_json_lines(stdout):
+        if not data.get("uploader"):
+            data["uploader"] = channel_title
+        results.append(SearchResult.from_dict(data))
+    if not results:
+        log.error("CHANNEL fetch empty for %s: %s", channel_url, stderr.decode("utf-8", errors="replace")[:500])
     return results
 
 

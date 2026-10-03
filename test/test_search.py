@@ -326,3 +326,41 @@ class TestWaitForFileGrowth:
             wait_for_file_growth(path, min_bytes=1000, timeout=0.1, stall_timeout=0.2)
         )
         assert result is False
+
+
+class TestFetchChannelVideos:
+    def _fake(self, responses):
+        calls = []
+
+        async def fake_run_ytdlp(*args):
+            calls.append(args)
+            return responses.pop(0)
+
+        return calls, fake_run_ytdlp
+
+    def test_display_name_with_spaces_resolves_via_channel_search(self):
+        search_hit = b'{"channel_url": "https://www.youtube.com/channel/UC123", "channel": "Mir Afsar Ali"}\n'
+        videos = b'{"id": "abcdefghijk", "title": "T", "webpage_url": "https://www.youtube.com/watch?v=abcdefghijk", "duration": 61}\n'
+        calls, fake = self._fake([(search_hit, b""), (videos, b"")])
+        with patch.object(search_module, "_run_ytdlp", fake):
+            results = asyncio.run(search_module.fetch_channel_videos("Mir Afsar Ali"))
+        assert "results?search_query=Mir+Afsar+Ali" in calls[0][-1]
+        assert calls[1][-1] == "https://www.youtube.com/channel/UC123/videos"
+        assert len(results) == 1
+        assert results[0].uploader == "Mir Afsar Ali"
+        assert results[0].duration_str == "1:01"
+
+    def test_handle_without_spaces_tried_directly(self):
+        direct = b'{"channel_url": "https://www.youtube.com/channel/UC9", "channel": "Real"}'
+        videos = b'{"id": "abcdefghijk", "title": "T", "webpage_url": "u", "duration": 5}\n'
+        calls, fake = self._fake([(direct, b""), (videos, b"")])
+        with patch.object(search_module, "_run_ytdlp", fake):
+            results = asyncio.run(search_module.fetch_channel_videos("realmir"))
+        assert calls[0][-1] == "https://www.youtube.com/@realmir/videos"
+        assert len(results) == 1
+
+    def test_unresolvable_channel_returns_empty(self):
+        calls, fake = self._fake([(b"", b"boom")])
+        with patch.object(search_module, "_run_ytdlp", fake):
+            results = asyncio.run(search_module.fetch_channel_videos("Mir Afsar Ali"))
+        assert results == []
