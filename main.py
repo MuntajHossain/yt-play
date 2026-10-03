@@ -1247,14 +1247,14 @@ class YouTubePlayerApp(App):
             if not batch:
                 log.warning("CHANNEL @%s returned no results", channel_name)
                 self.notify(f"Channel @{channel_name} not found or has no videos", timeout=4)
-                self.call_from_thread(self.pop_screen)
+                self.pop_screen()
                 return
             self._search_cache.extend(batch)
             self._search_exhausted = True
         except Exception as e:
             log.exception("CHANNEL fetch failed for @%s: %s", channel_name, str(e))
             self.notify(f"Failed to load channel @{channel_name}", timeout=3)
-            self.call_from_thread(self.pop_screen)
+            self.pop_screen()
             return
 
         self.results = self._search_cache[: self.SEARCH_PAGE_SIZE]
