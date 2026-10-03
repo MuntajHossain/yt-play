@@ -19,6 +19,7 @@ from textual.worker import get_current_worker
 
 from search import (
     search_youtube,
+    fetch_channel_videos,
     start_audio_download,
     wait_for_file_growth,
     DownloadHandle,
@@ -343,7 +344,7 @@ class SearchScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical():
-            yield SearchInput(placeholder="Search YouTube... ($0, $1... = repeat recent)", id="search_input")
+            yield SearchInput(placeholder="Search YouTube... (@channel = browse channel, $0/$1 = repeat recent)", id="search_input")
             yield LoadingIndicator(id="search_spinner")
             yield Label("Press Enter to search", id="search_status")
             yield Label("", id="recent_searches")
@@ -385,6 +386,15 @@ class SearchScreen(Screen):
             self.query_one("#search_status", Label).update(f"Repeating: {query}")
             self._set_loading(True)
             app.do_search(query, auto_play_first=True)
+            return
+        if value.startswith("@"):
+            channel_name = value[1:].strip()
+            if not channel_name:
+                self.query_one("#search_status", Label).update("Channel name required after @")
+                return
+            self.query_one("#search_status", Label).update(f"Loading channel: @{channel_name}...")
+            self._set_loading(True)
+            app.do_search_channel(channel_name)
             return
         self.query_one("#search_status", Label).update("Searching...")
         self._set_loading(True)
@@ -429,7 +439,8 @@ class ResultsScreen(Screen):
         option_list = self.query_one("#results_list", OptionList)
         self.query_one("#results_status", Label).update("")
         self.query_one("#results_spinner", LoadingIndicator).styles.display = "none"
-        title.update(f"Search Results ({len(results)}) — Page {app.search_page}")
+        query_label = "Channel" if app.search_query.startswith("@") else "Search Results"
+        title.update(f"{query_label}: {app.search_query} ({len(results)}) — Page {app.search_page}")
         option_list.clear_options()
         for i, res in enumerate(results):
             text = f"{res.title} [{res.duration_str}] - {res.uploader}"
@@ -1223,6 +1234,38 @@ class YouTubePlayerApp(App):
         else:
             self.push_screen(ResultsScreen())
         self._prefetch_next_page()
+
+    @work(exclusive=True)
+    async def do_search_channel(self, channel_name: str) -> None:
+        log.info("Loading channel: @%s", channel_name)
+        self.search_query = f"@{channel_name}"
+        self.search_page = 1
+        self._search_cache = []
+        self._search_exhausted = False
+        try:
+            batch = await fetch_channel_videos(channel_name, max_results=100)
+            self._search_cache.extend(batch)
+            self._search_exhausted = True
+        except Exception:
+            log.exception("Failed to fetch channel videos for @%s", channel_name)
+            self.notify("Failed to load channel", timeout=3)
+            self.call_from_thread(self.pop_screen)
+            return
+
+        self.results = self._search_cache[: self.SEARCH_PAGE_SIZE]
+        log.info("Channel @%s returned %d videos", channel_name, len(self.results))
+        if not self.results:
+            self.notify("Channel has no videos", timeout=3)
+            self.call_from_thread(self.pop_screen)
+            return
+
+        _play_notification_sound()
+        self.current_index = -1
+        self.current_title = ""
+        self.current_youtube_url = ""
+        self._queue_is_playlist = False
+        self._recovery_attempts = 0
+        self.push_screen(ResultsScreen())
 
     @work(exclusive=True)
     async def next_search_page(self) -> None:

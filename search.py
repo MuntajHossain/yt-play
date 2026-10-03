@@ -229,6 +229,41 @@ async def search_youtube(
     return results
 
 
+async def fetch_channel_videos(channel_name: str, max_results: int = 50) -> List[SearchResult]:
+    """Fetch all (or up to max_results) videos from a YouTube channel.
+
+    Takes a channel name (e.g., 'yt-play-channel') and constructs the channel URL,
+    then extracts videos via yt-dlp. Returns list of SearchResult objects.
+    """
+    channel_url = f"https://www.youtube.com/@{channel_name}/videos"
+    stdout, stderr = await _run_ytdlp(
+        "--dump-json",
+        "--no-warnings",
+        "--ignore-errors",
+        "--playlist-start", "1",
+        "--playlist-end", str(max_results),
+        channel_url,
+    )
+
+    results: List[SearchResult] = []
+    if not stdout:
+        err = stderr.decode("utf-8", errors="replace")[:200] if stderr else ""
+        log.warning("CHANNEL fetch failed for @%s: %s", channel_name, err)
+        return results
+
+    for line in stdout.decode("utf-8").strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            results.append(SearchResult.from_dict(data))
+        except json.JSONDecodeError:
+            continue
+
+    return results
+
+
 # Format selection notes:
 #   "bestaudio" lets yt-dlp pick whatever it considers best, which on YouTube
 #   is very often a DASH-fragmented stream (webm/opus served via googlevideo's
