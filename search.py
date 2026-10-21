@@ -390,6 +390,32 @@ class DownloadHandle:
     # stdout, at the moment it opens it - before any audio bytes arrive.
     _DEST_RE = re.compile(r"^\[download\] Destination:\s*(.+)$")
     _EXISTS_RE = re.compile(r"^\[download\] (.+) has already been downloaded$")
+    # Emitted via --progress-template (see start_audio_download): downloaded,
+    # total, estimated-total bytes. Any field may be "NA".
+    _PROG_RE = re.compile(r"^ytprog\s+(\S+)\s+(\S+)\s+(\S+)\s*$")
+
+    @classmethod
+    def parse_progress(cls, line: str) -> Optional[float]:
+        """Percent (0-100) from a ``ytprog`` line, or None if not one / total unknown."""
+        m = cls._PROG_RE.match(line.strip())
+        if not m:
+            return None
+        try:
+            downloaded = float(m.group(1))
+        except ValueError:
+            return None
+        total = None
+        for raw in (m.group(2), m.group(3)):
+            try:
+                val = float(raw)
+            except ValueError:
+                continue
+            if val > 0:
+                total = val
+                break
+        if total is None:
+            return None
+        return max(0.0, min(100.0, downloaded / total * 100.0))
 
     def __init__(self, process: Optional["asyncio.subprocess.Process"], dest_template: str, file_id: str, video_id: str, is_cached: bool = False):
         self.process = process
@@ -401,6 +427,7 @@ class DownloadHandle:
         self._done = is_cached
         self._error: Optional[str] = None
         self._is_cached = is_cached
+        self._percent: Optional[float] = None
         self._path_ready = asyncio.Event()
         self._stderr_chunks: List[bytes] = []
         self._stdout_task: Optional[asyncio.Task] = None
@@ -427,11 +454,23 @@ class DownloadHandle:
     def error(self) -> Optional[str]:
         return self._error
 
+    @property
+    def percent(self) -> Optional[float]:
+        """Download progress 0-100, or None if unknown (total size not reported)."""
+        if self._is_cached or (self.is_done and self._error is None
+                               and self.process is not None and self.process.returncode == 0):
+            return 100.0
+        return self._percent
+
     async def _read_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
         try:
             async for raw in self.process.stdout:
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                pct = self.parse_progress(line)
+                if pct is not None:
+                    self._percent = pct
+                    continue
                 match = self._DEST_RE.match(line) or self._EXISTS_RE.match(line)
                 if match and not self._path_ready.is_set():
                     self.file_path = match.group(1).strip()
@@ -567,6 +606,9 @@ async def start_audio_download(video_url: str) -> Tuple[Optional[DownloadHandle]
         "-f", AUDIO_FORMAT_SELECTOR,
         "--no-playlist",
         "--no-part",
+        "--newline",
+        "--progress-template",
+        "download:ytprog %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s",
         "-o", dest_template,
         video_url,
     )
@@ -635,16 +677,30 @@ async def fetch_video_title(url: str) -> str:
 
     Returns the title string, or the URL itself if the request fails or times out.
     """
-    cmd = _ytdlp_cmd("--dump-json", "--no-playlist", "--skip-download", url)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-        info = json.loads(stdout.decode())
-        return info.get("title") or url
-    except Exception:
-        log.exception("Failed to fetch title for %s", url)
-        return url
+    cmd = _ytdlp_cmd("--print", "%(title)s", "--no-playlist", "--skip-download", url)
+    proc = None
+    # yt-dlp's extraction time varies a lot (~5s to 20s+ under a slow network),
+    # so a short timeout silently degraded history entries to bare URLs.
+    for attempt in (1, 2):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=40.0)
+            title = stdout.decode("utf-8", errors="replace").strip().splitlines()
+            if title and title[-1].strip() and title[-1].strip() != "NA":
+                return title[-1].strip()
+            log.warning("fetch_video_title attempt %d: empty title for %s", attempt, url)
+        except Exception as e:
+            log.exception("Failed to fetch title for %s (attempt %d)", url, attempt)
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+            if isinstance(e, asyncio.TimeoutError):
+                break  # already waited the full timeout; don't stall playback longer
+    return url

@@ -856,6 +856,23 @@ class PlayerScreen(Screen):
         app: YouTubePlayerApp = self.app  # type: ignore
         self._update_now_playing(app.current_title)
         self.update_modes(app.repeat_enabled, app.shuffle_enabled)
+        self.set_interval(0.5, self._refresh_download)
+
+    def _refresh_download(self) -> None:
+        """Poll the active download's progress; keeps the % live during playback."""
+        app: YouTubePlayerApp = self.app  # type: ignore
+        handle = app._active_download
+        label = self.query_one("#download_status", Label)
+        if handle is None:
+            label.update("")
+            return
+        pct = handle.percent
+        if handle.is_cached:
+            label.update("Downloaded: 100% (cached)")
+        elif pct is None:
+            label.update("Downloading...")
+        else:
+            label.update(f"Downloaded: {pct:.1f}%")
 
     def update_now_playing(self, title: str) -> None:
         self._update_now_playing(title)
@@ -877,7 +894,8 @@ class PlayerScreen(Screen):
 
     def set_downloading(self, visible: bool) -> None:
         self.query_one("#download_spinner", LoadingIndicator).styles.display = "block" if visible else "none"
-        self.query_one("#download_status", Label).update("Downloading..." if visible else "")
+        if visible:
+            self.query_one("#download_status", Label).update("Downloading...")
 
     def update_progress(self, current_time: float, duration: float) -> None:
         """Called from the player callback – always on the main thread."""
@@ -1017,6 +1035,8 @@ class YouTubePlayerApp(App):
                 self._cleanup_active_download()
                 self.push_screen(PlayerScreen())
                 self._play_video_async(url, title, seek_to=position)
+                if self._title_is_placeholder(title, url):
+                    self._heal_title(url)
                 return
 
         # Not cached — treat like search result (downloads)
@@ -1031,6 +1051,34 @@ class YouTubePlayerApp(App):
             self._desired_position = position
             self.push_screen(PlayerScreen())
             self._play_video_async(url, title, seek_to=position)
+            if self._title_is_placeholder(title, url):
+                self._heal_title(url)
+
+    @staticmethod
+    def _title_is_placeholder(title: str, url: str) -> bool:
+        """True if *title* is just the URL (a failed earlier title fetch)."""
+        t = (title or "").strip()
+        return not t or t == url or t.lower().startswith(("http://", "https://"))
+
+    @work
+    async def _heal_title(self, url: str) -> None:
+        """Replace a URL-as-title with the real video title, in the background.
+
+        History entries saved while the title fetch failed keep the bare URL
+        forever, since replaying them passes that same URL along as the title.
+        Playback doesn't wait on this; once the title lands it updates the
+        now-playing label and rewrites the history entry.
+        """
+        from search import fetch_video_title
+        title = await fetch_video_title(url)
+        if self._title_is_placeholder(title, url) or self.current_youtube_url != url:
+            return
+        self.current_title = title
+        ps = self.screen
+        if isinstance(ps, PlayerScreen):
+            ps.update_now_playing(title)
+        self._save_resume_data()
+        log.info("TITLE healed for %s: %s", url, title)
 
     def action_play_from_url(self) -> None:
         self.push_screen(UrlModal(), self._on_url_dismiss)
@@ -1057,6 +1105,8 @@ class YouTubePlayerApp(App):
         if not isinstance(self.screen, PlayerScreen):
             self.push_screen(PlayerScreen())
         self._play_video_async(url, title)
+        if self._title_is_placeholder(title, url):
+            self._heal_title(url)
 
     # -- Resume / play history -------------------------------------------
 

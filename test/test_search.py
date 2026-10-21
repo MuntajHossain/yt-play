@@ -16,9 +16,54 @@ from search import (
     _remove_partial,
     search_youtube,
     SearchResult,
+    DownloadHandle,
     wait_for_file_growth,
 )
 from config import CONFIG
+
+
+# ---------------------------------------------------------------------------
+# DownloadHandle progress
+# ---------------------------------------------------------------------------
+
+class TestDownloadProgress:
+    def test_parse_total_bytes(self):
+        assert DownloadHandle.parse_progress("ytprog 500 1000 NA") == 50.0
+
+    def test_parse_falls_back_to_estimate(self):
+        assert DownloadHandle.parse_progress("ytprog 250 NA 1000") == 25.0
+
+    def test_parse_unknown_total(self):
+        assert DownloadHandle.parse_progress("ytprog 250 NA NA") is None
+
+    def test_parse_clamps_over_100(self):
+        assert DownloadHandle.parse_progress("ytprog 2000 1000 NA") == 100.0
+
+    def test_parse_ignores_other_lines(self):
+        assert DownloadHandle.parse_progress("[download] Destination: x.m4a") is None
+        assert DownloadHandle.parse_progress("ytprog abc 1000 NA") is None
+
+    def test_cached_handle_is_100(self):
+        async def run():
+            return DownloadHandle(None, "p", "vid", "vid", is_cached=True).percent
+        assert asyncio.run(run()) == 100.0
+
+    def test_stdout_reader_updates_percent_and_path(self):
+        async def run():
+            h = DownloadHandle(None, "p", "vid", "vid")
+            reader = asyncio.StreamReader()
+            reader.feed_data(b"[download] Destination: a.m4a\nytprog 100 400 NA\nytprog 300 400 NA\n")
+            reader.feed_eof()
+
+            class P:
+                stdout = reader
+                returncode = None
+            h.process = P()
+            await h._read_stdout()
+            return h.file_path, h.percent
+        path, pct = asyncio.run(run())
+        assert path == "a.m4a"
+        assert pct == 75.0
 
 
 # ---------------------------------------------------------------------------
@@ -364,3 +409,66 @@ class TestFetchChannelVideos:
         with patch.object(search_module, "_run_ytdlp", fake):
             results = asyncio.run(search_module.fetch_channel_videos("Mir Afsar Ali"))
         assert results == []
+
+
+# ---------------------------------------------------------------------------
+# fetch_video_title
+# ---------------------------------------------------------------------------
+
+class _FakeProc:
+    def __init__(self, out=b"", hang=False):
+        self._out, self._hang = out, hang
+        self.returncode = None
+        self.killed = False
+
+    async def communicate(self):
+        if self._hang:
+            await asyncio.sleep(3600)
+        self.returncode = 0
+        return self._out, b""
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        return self.returncode
+
+
+class TestFetchVideoTitle:
+    def _run(self, procs, timeout_patch=None):
+        it = iter(procs)
+
+        async def fake_exec(*a, **k):
+            return next(it)
+
+        async def go():
+            with patch("asyncio.create_subprocess_exec", fake_exec):
+                return await search_module.fetch_video_title("https://youtu.be/x")
+        return asyncio.run(go())
+
+    def test_returns_title(self):
+        assert self._run([_FakeProc(b"My Song\n")]) == "My Song"
+
+    def test_retries_after_empty_then_succeeds(self):
+        assert self._run([_FakeProc(b"NA\n"), _FakeProc(b"Real\n")]) == "Real"
+
+    def test_falls_back_to_url_when_empty_twice(self):
+        assert self._run([_FakeProc(b""), _FakeProc(b"")]) == "https://youtu.be/x"
+
+    def test_timeout_kills_process_and_falls_back(self):
+        p = _FakeProc(hang=True)
+
+        async def fake_exec(*a, **k):
+            return p
+
+        async def fake_wait_for(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError
+
+        async def go():
+            with patch("asyncio.create_subprocess_exec", fake_exec), \
+                 patch("asyncio.wait_for", fake_wait_for):
+                return await search_module.fetch_video_title("https://youtu.be/x")
+        assert asyncio.run(go()) == "https://youtu.be/x"
+        assert p.killed

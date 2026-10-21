@@ -800,3 +800,14 @@ class TestRecentRef:
 def test_notification_sound_never_raises():
     with patch("winsound.MessageBeep", side_effect=RuntimeError("boom"), create=True):
         _play_notification_sound()
+
+
+class TestTitlePlaceholder:
+    def test_url_title_is_placeholder(self):
+        url = "https://www.youtube.com/watch?v=abc"
+        assert YouTubePlayerApp._title_is_placeholder(url, url)
+        assert YouTubePlayerApp._title_is_placeholder("https://youtu.be/abc", url)
+        assert YouTubePlayerApp._title_is_placeholder("", url)
+
+    def test_real_title_is_not_placeholder(self):
+        assert not YouTubePlayerApp._title_is_placeholder("Some Song", "https://youtu.be/abc")
