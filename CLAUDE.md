@@ -8,6 +8,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Use the `caveman` skill in `ultra` mode (`/caveman ultra`) for all replies: terse caveman-speak at the most aggressive compression. Code, commands, and error output stay exact.
 
+Applies to **every** reply, including explanations, follow-up answers, and wrap-ups — not just the first. Do not drift to normal prose after a few turns, and do not fall back to `full` level because a hook says so; the hooks default to `full`, this repo requires `ultra`. If the session starts in another level, run `/caveman ultra` before the first reply.
+
+The skill is the [`caveman`](https://github.com/JuliusBrussee/caveman) plugin. `.claude/settings.json` (tracked) registers its marketplace and enables it, so a fresh clone gets it automatically; only `.claude/settings.local.json` is gitignored.
+
 ## Project Overview
 
 Terminal-based YouTube audio player. `yt-dlp` for search/stream extraction, `libmpv` (via `python-mpv`) for playback, `textual` for the TUI. Single-package layout — no `src/` dir, four top-level modules: `main.py`, `search.py`, `player.py`, `config.py`.

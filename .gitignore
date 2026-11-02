@@ -14,7 +14,7 @@ wheels/
 
 # Agent skills / tooling
 .agents/
-.claude/
+.claude/settings.local.json
 skills-lock.json
 
 # Runtime data & logs
