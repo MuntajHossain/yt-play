@@ -978,6 +978,11 @@ class YouTubePlayerApp(App):
         self._recovery_attempts: int = 0
         self.MAX_RECOVERY_ATTEMPTS: int = 3
         self._desired_position: float = 0.0
+        # Resume target whose deferred seek hasn't landed yet. Until mpv's
+        # time-pos reaches it (or the deadline passes) progress ticks must not
+        # overwrite _desired_position / history with the pre-seek 0.0.
+        self._pending_resume_pos: float = 0.0
+        self._pending_resume_deadline: float = 0.0
 
         self._active_download: Optional[DownloadHandle] = None
         self._active_download_worker = None
@@ -1012,7 +1017,10 @@ class YouTubePlayerApp(App):
         video_id = entry.get("video_id")
         title = entry.get("title", "Unknown")
         url = entry.get("url", "")
-        position = entry.get("position", 0.0)
+        position = self._clamp_resume_position(
+            float(entry.get("position", 0.0) or 0.0),
+            float(entry.get("duration", 0.0) or 0.0),
+        )
 
         if not url:
             self.notify("No URL in history entry", title="Error", severity="error")
@@ -1143,14 +1151,19 @@ class YouTubePlayerApp(App):
             return None
         for entry in self._read_history():
             if entry.get("video_id") == video_id:
-                position = float(entry.get("position", 0.0) or 0.0)
-                duration = float(entry.get("duration", 0.0) or 0.0)
-                if position <= 0:
-                    return None
-                if duration > 0 and position >= duration - 5:
-                    return None
-                return position
+                position = self._clamp_resume_position(
+                    float(entry.get("position", 0.0) or 0.0),
+                    float(entry.get("duration", 0.0) or 0.0),
+                )
+                return position if position > 0 else None
         return None
+
+    @staticmethod
+    def _clamp_resume_position(position: float, duration: float) -> float:
+        """0.0 (start over) if *position* is within 5s of *duration*, else *position*."""
+        if duration > 0 and position >= duration - 5:
+            return 0.0
+        return position
 
     def _read_history(self) -> list:
         """Read full history array from disk."""
@@ -1190,18 +1203,24 @@ class YouTubePlayerApp(App):
                 return entry.get("title", "Unknown")
         return None
 
-    def _save_resume_data(self) -> None:
-        """Upsert current position into play history — one entry per video_id."""
+    def _save_resume_data(self, position: Optional[float] = None) -> None:
+        """Upsert current position into play history — one entry per video_id.
+
+        *position* overrides the live position (used to store 0.0 on a natural
+        end so the next play starts from the top).
+        """
         if not self.current_youtube_url:
             return
         vid = _extract_video_id(self.current_youtube_url)
         if not vid:
             return
+        if position is None:
+            position = self._desired_position
         entry = {
             "video_id": vid,
             "title": self.current_title,
             "url": self.current_youtube_url,
-            "position": self._desired_position,
+            "position": position,
             "duration": self.player.duration,
             "saved_at": time.time(),
         }
@@ -1213,7 +1232,7 @@ class YouTubePlayerApp(App):
         if len(history) > self.MAX_HISTORY:
             history = history[-self.MAX_HISTORY:]
         self._write_history(history)
-        log.info("HISTORY upserted: %s at %.1fs (%d entries)", vid, self._desired_position, len(history))
+        log.info("HISTORY upserted: %s at %.1fs (%d entries)", vid, position, len(history))
 
     # -- Navigation -------------------------------------------------------
 
@@ -1452,6 +1471,9 @@ class YouTubePlayerApp(App):
                     self.notify(f"Resumed at {PlayerScreen._fmt(seek_to)}", timeout=3)
                     log.info("RESUME applied: %s at %.1fs", vid, seek_to)
 
+        self._pending_resume_pos = seek_to
+        self._pending_resume_deadline = time.monotonic() + 10.0
+
         # Cancel any previous _play_video_async worker still running (e.g.
         # one still stuck in the buffer-wait for a track we've since
         # switched away from, or quit out of) so it can't outlive us and
@@ -1614,10 +1636,17 @@ class YouTubePlayerApp(App):
             log.exception("_on_time_update call_from_thread failed")
 
     def _update_player_progress(self, current_time: float, duration: float) -> None:
-        self._desired_position = current_time
         ps = self.screen
         if isinstance(ps, PlayerScreen):
             ps.update_progress(current_time, duration)
+        if self._pending_resume_pos > 0:
+            # mpv reports 0.0 until the deferred resume seek lands; adopting
+            # that would overwrite the saved position (and _desired_position)
+            # with 0.0 if the user quits/seeks in the first 5s.
+            if current_time < self._pending_resume_pos - 2.0 and time.monotonic() < self._pending_resume_deadline:
+                return
+            self._pending_resume_pos = 0.0
+        self._desired_position = current_time
         # Persist position every 5s for resume on crash/quit.
         now = time.monotonic()
         if now - self._last_pos_save > 5.0:
@@ -1666,6 +1695,9 @@ class YouTubePlayerApp(App):
         else:
             log.info("TRACK_END normal -> advancing")
             log.info("HANDLE_TRACK_END -> advance_to_next")
+            # Finished: store 0.0 so a replay starts from the top instead of
+            # the last 5s tick (a few seconds before EOF).
+            self._save_resume_data(position=0.0)
             self._recovery_attempts = 0
             self._advance_to_next()
 
@@ -1679,7 +1711,14 @@ class YouTubePlayerApp(App):
         )
         if self.repeat_enabled:
             log.info("ADVANCE_TO_NEXT repeat-one: replaying index=%s", self.current_index)
-            self.play_at(self.current_index)
+            if 0 <= self.current_index < len(self.results):
+                self.play_at(self.current_index)
+            elif self.current_youtube_url:
+                # History/URL plays have no queue entry (index -1) — replay
+                # the current video directly; PlayerScreen is already showing.
+                self._recovery_attempts = 0
+                self._desired_position = 0.0
+                self._play_video_async(self.current_youtube_url, self.current_title, resume=False)
             return
         next_index = self._resolve_step_index(1)
         log.info(

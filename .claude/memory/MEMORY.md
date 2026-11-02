@@ -1,1 +1,2 @@
 - [Caveman ultra always](feedback-caveman-ultra-always.md) — every reply ultra level; repo rule beats hook default
+- [Run tests via venv](reference-run-tests-via-venv.md) — uv run broken here; use .venv python -m pytest

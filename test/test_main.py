@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -811,3 +812,122 @@ class TestTitlePlaceholder:
 
     def test_real_title_is_not_placeholder(self):
         assert not YouTubePlayerApp._title_is_placeholder("Some Song", "https://youtu.be/abc")
+
+
+# ------------------------------------------------------------------
+# Replay-of-a-finished-track regressions (log 20261102-103641-23580)
+#   - History replay resumed seconds before EOF (near-finished check skipped)
+#   - Natural end never saved, so the last 5s tick stayed as the resume point
+#   - First progress tick (pos 0.0, before the deferred seek) clobbered the
+#     saved resume position
+#   - Repeat did nothing for History/URL plays (empty queue, index -1)
+# ------------------------------------------------------------------
+
+_VID_URL = "https://www.youtube.com/watch?v=IF9GJstin2g"
+
+
+class TestReplayFinishedTrack:
+    def _make_app(self, tmp_path):
+        app = YouTubePlayerApp()
+        setattr(app, "_resume_path", str(tmp_path / "resume_state.json"))
+        return app
+
+    @pytest.mark.parametrize(
+        ("position", "duration", "expected"),
+        [
+            (254.8, 259.2, 0.0),   # within 5s of the end -> start over
+            (254.2, 259.2, 0.0),   # exactly duration - 5
+            (250.0, 259.2, 250.0),  # comfortably before the end -> resume
+            (100.0, 0.0, 100.0),   # unknown duration -> trust the position
+            (0.0, 259.2, 0.0),
+        ],
+    )
+    def test_clamp_resume_position(self, position, duration, expected):
+        assert YouTubePlayerApp._clamp_resume_position(position, duration) == expected
+
+    def test_history_entry_near_end_starts_over(self, tmp_path):
+        async def scenario():
+            app = self._make_app(tmp_path)
+            entry = {"video_id": "IF9GJstin2g", "title": "T", "url": _VID_URL,
+                     "position": 254.8, "duration": 259.2}
+            with patch("search._check_cache", return_value="data/x.webm"), \
+                    patch.object(YouTubePlayerApp, "_play_video_async") as play:
+                async with app.run_test() as pilot:
+                    app.play_history_entry(entry)
+                    await pilot.pause()
+            assert play.call_args.kwargs["seek_to"] == 0.0
+
+        asyncio.run(scenario())
+
+    def test_history_entry_mid_track_still_resumes(self, tmp_path):
+        async def scenario():
+            app = self._make_app(tmp_path)
+            entry = {"video_id": "IF9GJstin2g", "title": "T", "url": _VID_URL,
+                     "position": 120.0, "duration": 259.2}
+            with patch("search._check_cache", return_value="data/x.webm"), \
+                    patch.object(YouTubePlayerApp, "_play_video_async") as play:
+                async with app.run_test() as pilot:
+                    app.play_history_entry(entry)
+                    await pilot.pause()
+            assert play.call_args.kwargs["seek_to"] == 120.0
+
+        asyncio.run(scenario())
+
+    def test_natural_end_resets_saved_position(self, tmp_path):
+        app = self._make_app(tmp_path)
+        app.current_youtube_url = _VID_URL
+        app.current_title = "T"
+        app._desired_position = 254.8
+        app._save_resume_data()
+        assert app._read_history()[0]["position"] == 254.8
+        with patch.object(YouTubePlayerApp, "_advance_to_next"):
+            app._handle_track_end(None)
+        assert app._read_history()[0]["position"] == 0.0
+
+    def test_progress_before_deferred_seek_does_not_clobber(self, tmp_path):
+        async def scenario():
+            app = self._make_app(tmp_path)
+            app.current_youtube_url = _VID_URL
+            app.current_title = "T"
+            app._pending_resume_pos = 254.8
+            app._pending_resume_deadline = time.monotonic() + 10
+            app._desired_position = 254.8
+            async with app.run_test():
+                app._update_player_progress(0.0, 259.2)  # mpv still at 0.0
+                assert app._read_history() == []
+                assert app._desired_position == 254.8
+                app._update_player_progress(255.0, 259.2)  # seek landed
+                assert app._read_history()[0]["position"] == 255.0
+
+        asyncio.run(scenario())
+
+    def test_pending_resume_gate_expires(self, tmp_path):
+        """A seek that never lands must not disable position saving forever."""
+        async def scenario():
+            app = self._make_app(tmp_path)
+            app.current_youtube_url = _VID_URL
+            app.current_title = "T"
+            app._pending_resume_pos = 254.8
+            app._pending_resume_deadline = time.monotonic() - 1
+            async with app.run_test():
+                app._update_player_progress(3.0, 259.2)
+                assert app._read_history()[0]["position"] == 3.0
+
+        asyncio.run(scenario())
+
+    def test_repeat_replays_with_empty_queue(self, tmp_path):
+        async def scenario():
+            app = self._make_app(tmp_path)
+            app.results = []
+            app.current_index = -1
+            app.current_youtube_url = _VID_URL
+            app.current_title = "T"
+            app.repeat_enabled = True
+            with patch.object(YouTubePlayerApp, "_play_video_async") as play:
+                async with app.run_test():
+                    app._advance_to_next()
+            play.assert_called_once()
+            assert play.call_args.args[:2] == (_VID_URL, "T")
+            assert play.call_args.kwargs["resume"] is False
+
+        asyncio.run(scenario())
